@@ -7,7 +7,7 @@ import { NextRequest } from 'next/server'
 import { requireAuth } from '@/lib/auth/api-protection'
 import { getFirestoreClient } from '@/lib/firestore/client'
 import { doc, onSnapshot } from 'firebase/firestore'
-import { rateLimiters } from '@/lib/security/rate-limit'
+import { firestoreRateLimiters } from '@/lib/security/firestore-rate-limit'
 import { addSecurityHeaders } from '@/lib/security/headers'
 import { logError } from '@/lib/security/logging'
 import { handleApiError } from '@/lib/security/error-handler'
@@ -18,14 +18,14 @@ export async function GET(request: NextRequest) {
   const requestId = uuidv4()
   
   try {
-    // Rate limiting
-    const rateLimitResponse = await rateLimiters.api(request)
+    // Require authentication first (needed for user ID)
+    const user = await requireAuth(request)
+    
+    // Rate limiting: 10 STT chunks per second
+    const rateLimitResponse = await firestoreRateLimiters.sttChunks(request, user.id)
     if (rateLimitResponse) {
       return addSecurityHeaders(rateLimitResponse)
     }
-    
-    // Require authentication
-    await requireAuth(request)
 
     const consultationId = request.nextUrl.searchParams.get('consultationId')
     if (!consultationId) {

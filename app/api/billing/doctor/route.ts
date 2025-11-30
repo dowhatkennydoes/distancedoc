@@ -5,6 +5,7 @@
 import { NextRequest } from "next/server"
 import { apiError, apiSuccess } from "@/lib/auth/api-protection"
 import { requireSession, requireRole, getGuardContext } from "@/lib/auth/guards"
+import { withClinicScope } from "@/lib/auth/tenant-scope"
 import { prisma } from "@/db/prisma"
 
 // GET - Get doctor billing data
@@ -22,9 +23,12 @@ export async function GET(request: NextRequest) {
       return apiError("Doctor account pending approval", 403, context.requestId)
     }
 
-    // Get doctor record
+    // Get doctor record with clinic scoping
     const doctor = await prisma.doctor.findUnique({
-      where: { userId: session.id },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId, // Tenant isolation
+      },
       include: {
         appointments: {
           include: {
@@ -48,8 +52,10 @@ export async function GET(request: NextRequest) {
       return apiError("Doctor profile not found", 404, context.requestId)
     }
 
-    // Get all payments for appointments with this doctor
-    const appointmentIds = doctor.appointments.map((apt) => apt.id)
+    // Get all payments for appointments with this doctor (with clinic scoping)
+    const appointmentIds = doctor.appointments
+      .filter((apt) => apt.clinicId === session.clinicId) // Additional clinic filter
+      .map((apt) => apt.id)
     
     const payments = await prisma.payment.findMany({
       where: {

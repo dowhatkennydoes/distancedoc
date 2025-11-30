@@ -1,20 +1,23 @@
 /**
- * Next.js Middleware - World-Class Clinic-Level Authorization
+ * Next.js Middleware - Enhanced Route Protection
  * 
  * Features:
  * - JWT validation on every request
  * - Session expiry checking
  * - Role-based route protection
+ * - Query param spoofing prevention
+ * - Invalid/missing ID validation
+ * - Unknown route 404 rewriting
  * - Audit logging for all auth events
  * - Security headers enforcement
  * - Rate limiting
- * - CSRF protection
  * - Request tracking
  */
 
 import { updateSession } from '@/lib/supabase/middleware'
 import { NextResponse, type NextRequest } from 'next/server'
 import { logAudit, logWarn, logError } from '@/lib/security/logging'
+import { logUnauthorizedAccess, getRequestFromNextRequest } from '@/lib/security/event-logging'
 import { addSecurityHeaders } from '@/lib/security/headers'
 import { v4 as uuidv4 } from 'uuid'
 import { canAccess, getRoutePermission, type Permission } from '@/lib/auth/permissions'
@@ -68,6 +71,54 @@ const ADMIN_ROUTES = [
   /^\/api\/auth\/approve-doctor/,
 ]
 
+// Valid route patterns (for 404 detection)
+const VALID_ROUTE_PATTERNS = [
+  // Public routes
+  /^\/$/,
+  /^\/login$/,
+  /^\/signup\/(doctor|patient)$/,
+  /^\/reset$/,
+  /^\/doctor\/pending$/,
+  
+  // Doctor routes
+  /^\/doctor\/appointments$/,
+  /^\/doctor\/patients$/,
+  /^\/doctor\/patients\/[a-zA-Z0-9_-]+$/, // Dynamic ID
+  /^\/doctor\/messages$/,
+  /^\/doctor\/visit-notes$/,
+  /^\/doctor\/visit-notes\/[a-zA-Z0-9_-]+$/, // Dynamic ID
+  /^\/doctor\/forms$/,
+  /^\/doctor\/billing$/,
+  /^\/doctor\/settings$/,
+  /^\/dashboard$/,
+  
+  // Patient routes
+  /^\/patient$/,
+  /^\/patient\/visits$/,
+  /^\/patient\/forms$/,
+  /^\/patient\/forms\/[a-zA-Z0-9_-]+$/, // Dynamic ID
+  /^\/patient\/messages$/,
+  /^\/patient\/messages\/[a-zA-Z0-9_-]+$/, // Dynamic ID
+  /^\/patient\/files$/,
+  /^\/patient\/summaries$/,
+  /^\/patient\/summaries\/[a-zA-Z0-9_-]+$/, // Dynamic ID
+  /^\/patient\/payments$/,
+  
+  // API routes
+  /^\/api\/auth\//,
+  /^\/api\/doctor\//,
+  /^\/api\/patient\//,
+  /^\/api\/appointments\//,
+  /^\/api\/files\//,
+  /^\/api\/ai\//,
+  /^\/api\/stt\//,
+  /^\/api\/chat\//,
+  /^\/api\/soap-notes\//,
+  /^\/api\/visit-notes\//,
+  /^\/api\/payments\//,
+  /^\/api\/billing\//,
+]
+
 /**
  * Check if route matches pattern
  */
@@ -87,6 +138,124 @@ function isPublicRoute(pathname: string): boolean {
  */
 function isStaticAsset(pathname: string): boolean {
   return STATIC_ASSET_PATTERNS.some(pattern => pattern.test(pathname))
+}
+
+/**
+ * Validate ID format (CUID or UUID)
+ */
+function isValidId(id: string): boolean {
+  if (!id || typeof id !== 'string') return false
+  
+  // CUID format: starts with 'c', 25 characters
+  const cuidPattern = /^c[a-z0-9]{24}$/
+  // UUID format: 8-4-4-4-12 hex characters
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+  // Allow alphanumeric with hyphens/underscores (for flexibility)
+  const flexiblePattern = /^[a-zA-Z0-9_-]{1,100}$/
+  
+  return cuidPattern.test(id) || uuidPattern.test(id) || flexiblePattern.test(id)
+}
+
+/**
+ * Extract and validate IDs from pathname
+ */
+function validateRouteIds(pathname: string): { valid: boolean; invalidIds: string[] } {
+  const invalidIds: string[] = []
+  
+  // Match dynamic segments like [id], [patientId], etc.
+  const dynamicSegmentPattern = /\/([a-zA-Z0-9_-]+)(?=\/|$)/
+  const segments = pathname.split('/').filter(Boolean)
+  
+  // Check common ID parameter patterns
+  const idPatterns = [
+    /^patients\/([^/]+)/, // /patients/123
+    /^patient\/([^/]+)/,  // /patient/123
+    /^doctors\/([^/]+)/,  // /doctors/123
+    /^doctor\/([^/]+)/,   // /doctor/123
+    /^appointments\/([^/]+)/,
+    /^messages\/([^/]+)/,
+    /^forms\/([^/]+)/,
+    /^summaries\/([^/]+)/,
+    /^visit-notes\/([^/]+)/,
+    /^files\/([^/]+)/,
+  ]
+  
+  for (const pattern of idPatterns) {
+    const match = pathname.match(pattern)
+    if (match && match[1]) {
+      const id = match[1]
+      if (!isValidId(id)) {
+        invalidIds.push(id)
+      }
+    }
+  }
+  
+  // Also check query parameters for IDs
+  // This will be handled in the route handler, but we can log suspicious patterns
+  
+  return {
+    valid: invalidIds.length === 0,
+    invalidIds,
+  }
+}
+
+/**
+ * Check for query param spoofing attempts
+ */
+function detectQueryParamSpoofing(pathname: string, searchParams: URLSearchParams): {
+  detected: boolean
+  suspiciousParams: string[]
+} {
+  const suspiciousParams: string[] = []
+  
+  // Common ID parameter names that shouldn't be in query strings for security
+  const sensitiveParams = [
+    'patientId',
+    'doctorId',
+    'userId',
+    'appointmentId',
+    'consultationId',
+    'fileId',
+    'noteId',
+    'formId',
+  ]
+  
+  // Check if sensitive params are in query string (potential spoofing)
+  for (const param of sensitiveParams) {
+    if (searchParams.has(param)) {
+      // Allow if it's a valid route pattern, otherwise suspicious
+      const value = searchParams.get(param)
+      if (value && !isValidId(value)) {
+        suspiciousParams.push(param)
+      }
+    }
+  }
+  
+  // Check for path traversal attempts
+  if (pathname.includes('..') || pathname.includes('//')) {
+    suspiciousParams.push('path_traversal')
+  }
+  
+  // Check for encoded attempts
+  if (pathname.includes('%2e%2e') || pathname.includes('%2f%2f')) {
+    suspiciousParams.push('encoded_traversal')
+  }
+  
+  return {
+    detected: suspiciousParams.length > 0,
+    suspiciousParams,
+  }
+}
+
+/**
+ * Check if route is valid (exists in app directory)
+ */
+function isValidRoute(pathname: string): boolean {
+  // Remove query params for validation
+  const cleanPath = pathname.split('?')[0]
+  
+  // Check against known valid patterns
+  return VALID_ROUTE_PATTERNS.some(pattern => pattern.test(cleanPath))
 }
 
 /**
@@ -165,11 +334,6 @@ async function validateSession(supabase: any): Promise<{
       return { valid: false, user, session, error: 'Session expired' }
     }
 
-    // Check if token is expired
-    if (session.expires_at && session.expires_at < now) {
-      return { valid: false, user, session, error: 'Token expired' }
-    }
-
     return { valid: true, user, session }
   } catch (error: any) {
     return { valid: false, user: null, session: null, error: error.message || 'Session validation failed' }
@@ -182,40 +346,143 @@ async function validateSession(supabase: any): Promise<{
 async function getUserRole(supabase: any, userId: string): Promise<{
   role: string | null
   approved: boolean
+  clinicId: string | null
   doctorId?: string
   patientId?: string
 }> {
   try {
     const { data, error } = await supabase
       .from('user_roles')
-      .select('role, approved, doctor_id, patient_id')
+      .select('role, approved, clinic_id, doctor_id, patient_id')
       .eq('user_id', userId)
       .single()
 
     if (error || !data) {
-      return { role: null, approved: false }
+      return { role: null, approved: false, clinicId: null }
     }
 
     return {
       role: data.role || null,
       approved: data.approved || false,
+      clinicId: data.clinic_id || null,
       doctorId: data.doctor_id,
       patientId: data.patient_id,
     }
   } catch (error) {
-    return { role: null, approved: false }
+    return { role: null, approved: false, clinicId: null }
   }
 }
 
 export async function middleware(request: NextRequest) {
   const requestId = uuidv4()
   const pathname = request.nextUrl.pathname
+  const searchParams = request.nextUrl.searchParams
   const ip = getClientIP(request)
   const userAgent = request.headers.get('user-agent') || 'unknown'
 
   // Skip static assets
   if (isStaticAsset(pathname)) {
     return NextResponse.next()
+  }
+
+  // Check for query param spoofing BEFORE authentication
+  const spoofingCheck = detectQueryParamSpoofing(pathname, searchParams)
+  if (spoofingCheck.detected) {
+    logWarn(
+      'Query param spoofing detected',
+      { pathname, suspiciousParams: spoofingCheck.suspiciousParams, ip, userAgent },
+      undefined,
+      requestId
+    )
+    logAudit(
+      'SECURITY_VIOLATION',
+      'system',
+      ip,
+      'unknown',
+      false,
+      {
+        requestId,
+        pathname,
+        violation: 'query_param_spoofing',
+        suspiciousParams: spoofingCheck.suspiciousParams,
+      }
+    )
+    
+    // Log unauthorized access attempt
+    logUnauthorizedAccess(
+      undefined,
+      'route',
+      pathname,
+      `Query param spoofing: ${spoofingCheck.suspiciousParams.join(', ')}`,
+      getRequestFromNextRequest(request),
+      requestId
+    ).catch(err => console.error('Failed to log unauthorized access:', err))
+    
+    return addSecurityHeaders(
+      NextResponse.json(
+        { error: 'Invalid request parameters', requestId },
+        { status: 400 }
+      )
+    )
+  }
+
+  // Validate route IDs
+  const idValidation = validateRouteIds(pathname)
+  if (!idValidation.valid) {
+    logWarn(
+      'Invalid ID format detected',
+      { pathname, invalidIds: idValidation.invalidIds, ip, userAgent },
+      undefined,
+      requestId
+    )
+    logAudit(
+      'SECURITY_VIOLATION',
+      'system',
+      ip,
+      'unknown',
+      false,
+      {
+        requestId,
+        pathname,
+        violation: 'invalid_id_format',
+        invalidIds: idValidation.invalidIds,
+      }
+    )
+    
+    // Log unauthorized access attempt
+    logUnauthorizedAccess(
+      undefined,
+      'route',
+      pathname,
+      `Invalid ID format: ${idValidation.invalidIds.join(', ')}`,
+      getRequestFromNextRequest(request),
+      requestId
+    ).catch(err => console.error('Failed to log unauthorized access:', err))
+    
+    return addSecurityHeaders(
+      NextResponse.json(
+        { error: 'Invalid resource ID format', requestId },
+        { status: 400 }
+      )
+    )
+  }
+
+  // Check if route is valid (404 for unknown routes)
+  if (!isPublicRoute(pathname) && !isValidRoute(pathname)) {
+    logWarn(
+      'Unknown route accessed',
+      { pathname, ip, userAgent },
+      undefined,
+      requestId
+    )
+    
+    // Return 404 for unknown routes
+    return addSecurityHeaders(
+      NextResponse.json(
+        { error: 'Not found', requestId },
+        { status: 404 }
+      )
+    )
   }
 
   // Update Supabase session (handles cookie refresh)
@@ -306,30 +573,79 @@ export async function middleware(request: NextRequest) {
     return addSecurityHeaders(NextResponse.redirect(redirectUrl))
   }
 
-  const { role, approved, doctorId, patientId } = roleData
+  // Validate clinicId exists
+  if (!roleData.clinicId) {
+    logError(
+      'User clinicId not found',
+      undefined,
+      { userId: user.id, pathname },
+      user.id,
+      requestId
+    )
+    logAudit(
+      'AUTH_FAILED',
+      'user',
+      user.id,
+      user.id,
+      false,
+      { requestId, pathname, reason: 'Clinic not assigned' }
+    )
+
+    const redirectUrl = new URL('/login', request.url)
+    redirectUrl.searchParams.set('error', 'clinic_not_assigned')
+    return addSecurityHeaders(NextResponse.redirect(redirectUrl))
+  }
+
+  const { role, approved, clinicId, doctorId, patientId } = roleData
 
   // Log successful authentication (for audit trail)
+  logAudit(
+    'AUTH_SUCCESS',
+    'user',
+    user.id,
+    user.id || 'unknown',
+    true,
+    {
+      requestId,
+      pathname,
+      role,
+      clinicId, // Tenant isolation
+      approved,
+      ip,
+      userAgent,
+    }
+  )
+
+  // ENHANCED ROLE-BASED ROUTE PROTECTION
+
+  // Prevent patients from accessing doctor routes
+  if (matchesRoute(pathname, DOCTOR_ROUTES)) {
+    if (role === 'patient') {
       logAudit(
-        'AUTH_SUCCESS',
+        'ACCESS_DENIED',
         'user',
         user.id,
-        user.id || 'unknown',
-        true,
-        {
-          requestId,
-          pathname,
-          role,
-          approved,
-          ip,
-          userAgent,
-        }
+        user.id,
+        false,
+        { requestId, pathname, requiredRole: 'doctor', userRole: role }
       )
-
-  // Role-based route protection
-
-  // Doctor routes
-  if (matchesRoute(pathname, DOCTOR_ROUTES)) {
-    if (role !== 'doctor') {
+      
+      // Log unauthorized access attempt
+      logUnauthorizedAccess(
+        user.id,
+        'doctor_route',
+        pathname,
+        'Patient attempting to access doctor route',
+        getRequestFromNextRequest(request),
+        requestId
+      ).catch(err => console.error('Failed to log unauthorized access:', err))
+      
+      return addSecurityHeaders(
+        NextResponse.redirect(new URL('/patient', request.url))
+      )
+    }
+    
+    if (role !== 'doctor' && role !== 'admin') {
       logAudit(
         'ACCESS_DENIED',
         'user',
@@ -343,7 +659,7 @@ export async function middleware(request: NextRequest) {
       )
     }
 
-    if (!approved) {
+    if (role === 'doctor' && !approved) {
       logAudit(
         'ACCESS_DENIED',
         'user',
@@ -358,9 +674,34 @@ export async function middleware(request: NextRequest) {
     }
   }
 
-  // Patient routes
+  // Prevent doctors from accessing patient routes
   if (matchesRoute(pathname, PATIENT_ROUTES)) {
-    if (role !== 'patient') {
+    if (role === 'doctor') {
+      logAudit(
+        'ACCESS_DENIED',
+        'user',
+        user.id,
+        user.id,
+        false,
+        { requestId, pathname, requiredRole: 'patient', userRole: role }
+      )
+      
+      // Log unauthorized access attempt
+      logUnauthorizedAccess(
+        user.id,
+        'patient_route',
+        pathname,
+        'Doctor attempting to access patient route',
+        getRequestFromNextRequest(request),
+        requestId
+      ).catch(err => console.error('Failed to log unauthorized access:', err))
+      
+      return addSecurityHeaders(
+        NextResponse.redirect(new URL('/dashboard', request.url))
+      )
+    }
+    
+    if (role !== 'patient' && role !== 'admin') {
       logAudit(
         'ACCESS_DENIED',
         'user',
@@ -440,6 +781,7 @@ export async function middleware(request: NextRequest) {
   response.headers.set('X-Request-ID', requestId)
   response.headers.set('X-User-Role', role)
   response.headers.set('X-User-ID', user.id)
+  response.headers.set('X-Clinic-ID', clinicId)
 
   return response
 }

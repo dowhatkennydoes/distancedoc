@@ -5,6 +5,7 @@
 // TODO: Handle rate limit exceeded responses
 
 import { NextRequest, NextResponse } from 'next/server'
+import { logRateLimitViolation, getRequestFromNextRequest } from './event-logging'
 
 interface RateLimitConfig {
   windowMs: number // Time window in milliseconds
@@ -60,6 +61,17 @@ export function createRateLimiter(config: RateLimitConfig) {
       // Check if limit exceeded
       if (entry.count > config.maxRequests) {
         const retryAfter = Math.ceil((entry.resetTime - now) / 1000)
+        
+        // Log rate limit violation (async, don't await to avoid blocking)
+        const endpoint = new URL(request.url).pathname
+        logRateLimitViolation(
+          undefined, // userId if available (would need to extract from request)
+          endpoint,
+          config.maxRequests,
+          getRequestFromNextRequest(request),
+          request.headers.get('x-request-id') || undefined
+        ).catch(err => console.error('Failed to log rate limit violation:', err))
+        
         return new NextResponse(
           JSON.stringify({ 
             error: 'Too many requests',

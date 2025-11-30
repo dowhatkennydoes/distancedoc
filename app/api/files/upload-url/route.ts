@@ -10,7 +10,7 @@ import { requireAuth, apiError } from '@/lib/auth/api-protection'
 import { prisma } from '@/db/prisma'
 import { generateSignedUploadUrl, getStorageClient, getBucket } from '@/lib/gcp/gcp-storage'
 import { z } from 'zod'
-import { rateLimiters } from '@/lib/security/rate-limit'
+import { firestoreRateLimiters } from '@/lib/security/firestore-rate-limit'
 import { sanitizeFileName, sanitizeString } from '@/lib/security/sanitize'
 import { addSecurityHeaders } from '@/lib/security/headers'
 import { logError, logAudit } from '@/lib/security/logging'
@@ -48,14 +48,14 @@ export async function POST(request: NextRequest) {
   const requestId = uuidv4()
   
   try {
-    // Rate limiting
-    const rateLimitResponse = await rateLimiters.upload(request)
+    // Require authentication first (needed for user ID)
+    const user = await requireAuth(request)
+    
+    // Rate limiting: 10 uploads per minute
+    const rateLimitResponse = await firestoreRateLimiters.upload(request, user.id)
     if (rateLimitResponse) {
       return addSecurityHeaders(rateLimitResponse)
     }
-    
-    // Require authentication
-    const user = await requireAuth(request)
 
     // Get patient or doctor record
     const patient = await prisma.patient.findUnique({
@@ -195,13 +195,14 @@ export async function PUT(request: NextRequest) {
   const requestId = uuidv4()
   
   try {
-    // Rate limiting
-    const rateLimitResponse = await rateLimiters.upload(request)
+    // Require authentication first (needed for user ID)
+    const user = await requireAuth(request)
+    
+    // Rate limiting: 10 uploads per minute
+    const rateLimitResponse = await firestoreRateLimiters.upload(request, user.id)
     if (rateLimitResponse) {
       return addSecurityHeaders(rateLimitResponse)
     }
-    
-    const user = await requireAuth(request)
 
     const body = await request.json()
     const { fileId } = z.object({ fileId: z.string() }).parse(body)

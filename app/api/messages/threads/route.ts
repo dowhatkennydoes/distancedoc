@@ -6,6 +6,7 @@
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
 import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
+import { withClinicScope } from '@/lib/auth/tenant-scope'
 import { prisma } from '@/db/prisma'
 
 // GET - Get message threads
@@ -19,15 +20,21 @@ export async function GET(request: NextRequest) {
     // Require patient or doctor role
     requireRole(session, ['patient', 'doctor'], context)
 
-    // Get patient or doctor record
+    // Get patient or doctor record with clinic scoping
     const patient = await prisma.patient.findUnique({
-      where: { userId: session.id },
-      select: { id: true },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId, // Tenant isolation
+      },
+      select: { id: true, clinicId: true },
     })
 
     const doctor = await prisma.doctor.findUnique({
-      where: { userId: session.id },
-      select: { id: true },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId, // Tenant isolation
+      },
+      select: { id: true, clinicId: true },
     })
 
     if (!patient && !doctor) {
@@ -36,9 +43,9 @@ export async function GET(request: NextRequest) {
 
     let threads
     if (patient) {
-      // Get threads where patient is involved
+      // Get threads where patient is involved (with clinic scoping)
       threads = await prisma.messageThread.findMany({
-        where: { patientId: patient.id },
+        where: withClinicScope(session.clinicId, { patientId: patient.id }),
         include: {
           doctor: {
             include: {
@@ -68,9 +75,9 @@ export async function GET(request: NextRequest) {
         orderBy: { lastMessageAt: 'desc' },
       })
     } else if (doctor) {
-      // Get threads where doctor is involved
+      // Get threads where doctor is involved (with clinic scoping)
       threads = await prisma.messageThread.findMany({
-        where: { doctorId: doctor.id },
+        where: withClinicScope(session.clinicId, { doctorId: doctor.id }),
         include: {
           patient: {
             include: {

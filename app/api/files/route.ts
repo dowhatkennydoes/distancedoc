@@ -6,6 +6,7 @@
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
 import { requireSession, requireRole, requireOwnership, getGuardContext } from '@/lib/auth/guards'
+import { withClinicScope } from '@/lib/auth/tenant-scope'
 import { prisma } from '@/db/prisma'
 import { uploadFile } from '@/lib/gcp/gcp-storage'
 
@@ -20,10 +21,13 @@ export async function GET(request: NextRequest) {
     // Require patient role
     requireRole(session, 'patient', context)
 
-    // Get patient record
+    // Get patient record with clinic scoping
     const patient = await prisma.patient.findUnique({
-      where: { userId: session.id },
-      select: { id: true },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId, // Tenant isolation
+      },
+      select: { id: true, clinicId: true },
     })
 
     if (!patient) {
@@ -35,13 +39,12 @@ export async function GET(request: NextRequest) {
 
     const category = request.nextUrl.searchParams.get('category')
 
-    const category = request.nextUrl.searchParams.get('category')
-
+    // Get files with clinic scoping
     const files = await prisma.fileRecord.findMany({
-      where: {
+      where: withClinicScope(session.clinicId, {
         patientId: patient.id,
         ...(category && { category }),
-      },
+      }),
       orderBy: { createdAt: 'desc' },
     })
 
@@ -68,10 +71,13 @@ export async function POST(request: NextRequest) {
     // Require patient role
     requireRole(session, 'patient', context)
 
-    // Get patient record
+    // Get patient record with clinic scoping
     const patient = await prisma.patient.findUnique({
-      where: { userId: session.id },
-      select: { id: true },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId, // Tenant isolation
+      },
+      select: { id: true, clinicId: true },
     })
 
     if (!patient) {
@@ -126,7 +132,7 @@ export async function POST(request: NextRequest) {
       expires: Date.now() + 365 * 24 * 60 * 60 * 1000, // 1 year
     })
 
-    // Create file record
+    // Create file record with clinic scoping
     const fileRecord = await prisma.fileRecord.create({
       data: {
         patientId: patient.id,
@@ -138,6 +144,7 @@ export async function POST(request: NextRequest) {
         category: category || 'General',
         description: description || null,
         uploadedBy: session.id,
+        // Note: FileRecord doesn't have clinicId directly, but it's scoped through patient
       },
     })
 

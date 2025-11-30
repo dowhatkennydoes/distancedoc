@@ -8,6 +8,7 @@ export interface AuthUser {
   email: string
   role: UserRole
   emailVerified?: boolean
+  clinicId: string // Tenant isolation - clinic identifier
   metadata?: {
     doctorId?: string
     patientId?: string

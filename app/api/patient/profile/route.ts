@@ -4,6 +4,7 @@
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
 import { requireSession, requireRole, requireOwnership, getGuardContext } from '@/lib/auth/guards'
+import { withClinicScope } from '@/lib/auth/tenant-scope'
 import { prisma } from '@/db/prisma'
 
 export async function GET(request: NextRequest) {
@@ -17,7 +18,10 @@ export async function GET(request: NextRequest) {
     requireRole(session, 'patient', context)
 
     const patient = await prisma.patient.findUnique({
-      where: { userId: session.id },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId, // Tenant isolation
+      },
       include: {
         user: {
           select: {

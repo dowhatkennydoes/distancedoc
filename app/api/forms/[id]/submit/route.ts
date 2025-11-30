@@ -5,6 +5,7 @@
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
 import { requireSession, requireRole, requireOwnership, getGuardContext } from '@/lib/auth/guards'
+import { verifyClinicAccess, withClinicScope } from '@/lib/auth/tenant-scope'
 import { prisma } from '@/db/prisma'
 import { z } from 'zod'
 import type { FormResponse, ConsultationIntakeData } from '@/lib/forms/types'
@@ -46,15 +47,31 @@ export async function POST(
       return apiError('Form not found', 404, context.requestId)
     }
 
-    // Verify consultation exists and user has access
+    // Verify consultation exists and user has access (with clinic scoping)
     const consultation = await prisma.consultation.findUnique({
       where: { id: validatedData.consultationId },
-      select: { id: true, patientId: true, doctorId: true },
+      include: {
+        patient: {
+          select: { clinicId: true },
+        },
+        doctor: {
+          select: { clinicId: true },
+        },
+      },
     })
 
     if (!consultation) {
       return apiError('Consultation not found', 404, context.requestId)
     }
+
+    // Verify clinic access
+    verifyClinicAccess(
+      consultation.patient.clinicId,
+      session.clinicId,
+      'consultation',
+      validatedData.consultationId,
+      context.requestId
+    )
 
     // Verify ownership - patient or doctor must own the consultation
     if (session.role === 'patient') {

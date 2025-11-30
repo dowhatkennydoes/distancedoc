@@ -6,6 +6,7 @@
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
 import { requireSession, requireRole, requireOwnership, getGuardContext } from '@/lib/auth/guards'
+import { withClinicScope } from '@/lib/auth/tenant-scope'
 import { prisma } from '@/db/prisma'
 
 // GET - Get patient appointments
@@ -19,10 +20,13 @@ export async function GET(request: NextRequest) {
     // Require patient role
     requireRole(session, 'patient', context)
 
-    // Get patient record
+    // Get patient record with clinic scoping
     const patient = await prisma.patient.findUnique({
-      where: { userId: session.id },
-      select: { id: true },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId, // Tenant isolation
+      },
+      select: { id: true, clinicId: true },
     })
 
     if (!patient) {
@@ -46,8 +50,9 @@ export async function GET(request: NextRequest) {
       where.scheduledAt = { gte: new Date() }
     }
 
+    // Get appointments with clinic scoping
     const appointments = await prisma.appointment.findMany({
-      where,
+      where: withClinicScope(session.clinicId, where),
       include: {
         doctor: {
           include: {

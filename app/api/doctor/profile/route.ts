@@ -5,6 +5,7 @@
 import { NextRequest } from "next/server"
 import { apiError, apiSuccess } from "@/lib/auth/api-protection"
 import { requireSession, requireRole, getGuardContext } from "@/lib/auth/guards"
+import { withClinicScope } from "@/lib/auth/tenant-scope"
 import { prisma } from "@/db/prisma"
 import { createClient } from "@/lib/supabase/server"
 import { z } from "zod"
@@ -41,9 +42,12 @@ export async function GET(request: NextRequest) {
       return apiError("Doctor account pending approval", 403, context.requestId)
     }
 
-    // Get doctor record
+    // Get doctor record with clinic scoping
     const doctor = await prisma.doctor.findUnique({
-      where: { userId: session.id },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId, // Tenant isolation
+      },
     })
 
     if (!doctor) {
@@ -103,9 +107,12 @@ export async function PUT(request: NextRequest) {
     const body = await request.json()
     const validatedData = UpdateProfileSchema.parse(body)
 
-    // Get doctor record
+    // Get doctor record with clinic scoping
     const doctor = await prisma.doctor.findUnique({
-      where: { userId: session.id },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId, // Tenant isolation
+      },
     })
 
     if (!doctor) {

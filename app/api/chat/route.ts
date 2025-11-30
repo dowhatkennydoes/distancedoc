@@ -9,6 +9,10 @@
 // TODO: Add typing indicators
 
 import { NextRequest, NextResponse } from 'next/server'
+import { requireAuth } from '@/lib/auth/api-protection'
+import { firestoreRateLimiters } from '@/lib/security/firestore-rate-limit'
+import { addSecurityHeaders } from '@/lib/security/headers'
+import { apiError } from '@/lib/auth/api-protection'
 
 // TODO: Implement GET chat messages endpoint
 export async function GET(request: NextRequest) {
@@ -21,12 +25,25 @@ export async function GET(request: NextRequest) {
 
 // TODO: Implement POST message endpoint
 export async function POST(request: NextRequest) {
-  // TODO: Parse request body (chatId, message, senderId)
-  // TODO: Validate sender permissions
-  // TODO: Encrypt message content
-  // TODO: Save message to Firestore
-  // TODO: Send push notification to recipient
-  
-  return NextResponse.json({ message: 'Send message endpoint - to be implemented' })
+  try {
+    // Require authentication first (needed for user ID)
+    const user = await requireAuth(request)
+    
+    // Rate limiting: 20 messages per minute per user
+    const rateLimitResponse = await firestoreRateLimiters.messaging(request, user.id)
+    if (rateLimitResponse) {
+      return addSecurityHeaders(rateLimitResponse)
+    }
+    
+    // TODO: Parse request body (chatId, message, senderId)
+    // TODO: Validate sender permissions
+    // TODO: Encrypt message content
+    // TODO: Save message to Firestore
+    // TODO: Send push notification to recipient
+    
+    return NextResponse.json({ message: 'Send message endpoint - to be implemented' })
+  } catch (error: any) {
+    return addSecurityHeaders(apiError(error.message || 'Internal server error', 500))
+  }
 }
 

@@ -5,6 +5,7 @@
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
 import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
+import { verifyClinicAccess } from '@/lib/auth/tenant-scope'
 import { prisma } from '@/db/prisma'
 import { z } from 'zod'
 
@@ -33,11 +34,25 @@ export async function GET(
 
     const form = await prisma.intakeForm.findUnique({
       where: { id: params.id },
+      include: {
+        patient: {
+          select: { clinicId: true },
+        },
+      },
     })
 
     if (!form) {
       return apiError('Form not found', 404, context.requestId)
     }
+
+    // Verify clinic access
+    verifyClinicAccess(
+      form.patient.clinicId,
+      session.clinicId,
+      'intakeForm',
+      params.id,
+      context.requestId
+    )
 
     return apiSuccess(form, 200, context.requestId)
   } catch (error: any) {

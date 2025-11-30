@@ -1,7 +1,18 @@
 "use client"
 
+/**
+ * Enhanced Auth Guard Component
+ * 
+ * Features:
+ * - Role-based access control
+ * - Doctor/patient route separation
+ * - Approval status checking
+ * - Automatic redirects
+ * - Hydration-safe
+ */
+
 import * as React from "react"
-import { useRouter } from "next/navigation"
+import { useRouter, usePathname } from "next/navigation"
 import { useAuth } from "@/contexts/AuthContext"
 import { PageSkeleton } from "@/components/ui/loading-skeletons"
 
@@ -10,6 +21,8 @@ interface AuthGuardProps {
   requiredRole?: "doctor" | "patient" | "admin"
   requireApproval?: boolean
   redirectTo?: string
+  // Prevent cross-role access
+  preventCrossRoleAccess?: boolean
 }
 
 export function AuthGuard({
@@ -17,9 +30,11 @@ export function AuthGuard({
   requiredRole,
   requireApproval = false,
   redirectTo,
+  preventCrossRoleAccess = true,
 }: AuthGuardProps) {
   const { user, loading } = useAuth()
   const router = useRouter()
+  const pathname = usePathname()
   const [mounted, setMounted] = React.useState(false)
 
   React.useEffect(() => {
@@ -35,18 +50,50 @@ export function AuthGuard({
       return
     }
 
-    // Check role requirement
-    if (requiredRole && user.role !== requiredRole && user.role !== "admin") {
-      router.push(redirectTo || "/dashboard")
-      return
+    // Enhanced role checking with cross-role prevention
+    if (requiredRole) {
+      // Strict role matching (admin can access anything)
+      if (user.role !== requiredRole && user.role !== "admin") {
+        // Prevent cross-role access
+        if (preventCrossRoleAccess) {
+          // If patient trying to access doctor route, redirect to patient portal
+          if (user.role === "patient" && requiredRole === "doctor") {
+            router.push("/patient")
+            return
+          }
+          // If doctor trying to access patient route, redirect to doctor dashboard
+          if (user.role === "doctor" && requiredRole === "patient") {
+            router.push("/dashboard")
+            return
+          }
+        }
+        
+        router.push(redirectTo || "/dashboard")
+        return
+      }
     }
 
-    // Check approval requirement
-    if (requireApproval && !user.metadata?.approved) {
+    // Check approval requirement (for doctors)
+    if (requireApproval && user.role === "doctor" && !user.metadata?.approved) {
       router.push(redirectTo || "/doctor/pending")
       return
     }
-  }, [user, loading, mounted, requiredRole, requireApproval, redirectTo, router])
+
+    // Additional protection: Check pathname for role mismatches
+    if (preventCrossRoleAccess && pathname) {
+      // Patient accessing doctor routes
+      if (user.role === "patient" && pathname.startsWith("/doctor")) {
+        router.push("/patient")
+        return
+      }
+      
+      // Doctor accessing patient routes
+      if (user.role === "doctor" && pathname.startsWith("/patient")) {
+        router.push("/dashboard")
+        return
+      }
+    }
+  }, [user, loading, mounted, requiredRole, requireApproval, redirectTo, router, pathname, preventCrossRoleAccess])
 
   if (!mounted || loading) {
     return <PageSkeleton />
@@ -60,7 +107,7 @@ export function AuthGuard({
     return null
   }
 
-  if (requireApproval && !user.metadata?.approved) {
+  if (requireApproval && user.role === "doctor" && !user.metadata?.approved) {
     return null
   }
 

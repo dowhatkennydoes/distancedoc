@@ -5,15 +5,16 @@
 // TODO: Use low temperature and JSON mode
 // TODO: Add safety guardrails to prevent hallucinating diagnoses
 
-import { NextRequest } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { requireAuth, apiError } from '@/lib/auth/api-protection'
 import { getVertexAIClient } from '@/lib/gcp/gcp-vertex'
 import { z } from 'zod'
-import { rateLimiters } from '@/lib/security/rate-limit'
+import { firestoreRateLimiters } from '@/lib/security/firestore-rate-limit'
 import { sanitizeString, sanitizeJson } from '@/lib/security/sanitize'
 import { addSecurityHeaders } from '@/lib/security/headers'
 import { logError, logAudit } from '@/lib/security/logging'
 import { handleApiError } from '@/lib/security/error-handler'
+import { logSOAPNoteCreate, getRequestFromNextRequest } from '@/lib/security/event-logging'
 import { v4 as uuidv4 } from 'uuid'
 
 // TODO: Input validation schema
@@ -57,14 +58,14 @@ export async function POST(request: NextRequest) {
   const requestId = uuidv4()
   
   try {
-    // Rate limiting
-    const rateLimitResponse = await rateLimiters.sensitive(request)
+    // Require authentication first (needed for user ID)
+    const user = await requireAuth(request)
+    
+    // Rate limiting: 10 SOAP generations per minute per doctor
+    const rateLimitResponse = await firestoreRateLimiters.soapGeneration(request, user.id)
     if (rateLimitResponse) {
       return addSecurityHeaders(rateLimitResponse)
     }
-    
-    // Require authentication
-    const user = await requireAuth(request)
 
     // Parse and validate request body (limit size)
     const body = await request.json()
@@ -120,8 +121,8 @@ export async function POST(request: NextRequest) {
       ],
     }
 
-    const [response] = await model.generateContent(requestConfig)
-    const responseText = response.response.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
+    const [aiResponse] = await model.generateContent(requestConfig)
+    const responseText = aiResponse.response.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
 
     // Parse JSON response
     let soapNote: SOAPNoteResponse
@@ -141,17 +142,23 @@ export async function POST(request: NextRequest) {
     soapNote.risks = soapNote.risks || []
     soapNote.billingCodes = soapNote.billingCodes || []
 
+    // Log SOAP note creation with PHI-safe logging
+    // Note: The noteId will be generated when saved to database
+    // For now, we log with a temporary ID
+    await logSOAPNoteCreate(
+      user.id,
+      'ai-generated', // Will be replaced with actual noteId when saved
+      user.role,
+      getRequestFromNextRequest(request),
+      requestId
+    )
+    
     logAudit('SOAP_NOTE_GENERATED', 'visit_note', 'ai-generated', user.id, true, {
       requestId,
       model: 'gemini-1.5-flash',
     })
 
-    const response = new Response(JSON.stringify(soapNote), {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    })
+    const response = NextResponse.json(soapNote, { status: 200 })
     return addSecurityHeaders(response)
   } catch (error: any) {
     return addSecurityHeaders(handleApiError(error, 'Failed to generate SOAP note', undefined, requestId))

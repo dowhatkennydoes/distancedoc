@@ -171,7 +171,7 @@ export async function getAuthUser(request?: NextRequest): Promise<AuthUser | nul
   // Get user role from database
   const { data: userMetadata, error: roleError } = await supabase
     .from('user_roles')
-    .select('role, doctor_id, patient_id, approved')
+    .select('role, doctor_id, patient_id, approved, clinic_id')
     .eq('user_id', user.id)
     .single()
 
@@ -193,12 +193,14 @@ export async function getAuthUser(request?: NextRequest): Promise<AuthUser | nul
     doctor_id: string | null
     patient_id: string | null
     approved: boolean | null
+    clinic_id: string | null
   }
 
   const role = (roleData.role as UserRole) || 'patient'
   const doctorId = roleData.doctor_id || undefined
   const patientId = roleData.patient_id || undefined
   const approved = roleData.approved || false
+  const clinicId = roleData.clinic_id || 'default-clinic'
 
   // Log successful authentication
   if (context) {
@@ -223,6 +225,7 @@ export async function getAuthUser(request?: NextRequest): Promise<AuthUser | nul
     email: user.email!,
     role,
     emailVerified: user.email_confirmed_at !== null,
+    clinicId,
     metadata: {
       doctorId,
       patientId,
@@ -417,6 +420,17 @@ export async function verifyResourceAccess(
         })
 
         if (!consultation) {
+          // Log unauthorized access attempt
+          const { logUnauthorizedAccess, getRequestFromNextRequest } = await import('@/lib/security/event-logging')
+          await logUnauthorizedAccess(
+            userId,
+            resourceType,
+            resourceId,
+            'Resource not found',
+            undefined, // Request not available in this context
+            requestId
+          )
+          
           logAudit(
             'RESOURCE_ACCESS_DENIED',
             'user',

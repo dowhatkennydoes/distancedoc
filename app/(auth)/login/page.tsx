@@ -20,7 +20,7 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false)
   const router = useRouter()
   const searchParams = useSearchParams()
-  const { refresh } = useAuth()
+  const { setUser } = useAuth()
   const { toast } = useToast()
 
   const handleLogin = async (e: React.FormEvent) => {
@@ -41,11 +41,14 @@ export default function LoginPage() {
         throw new Error(data.error || "Login failed")
       }
 
-      // Refresh auth context
-      await refresh()
+      // Update auth context directly with user data from login response
+      // This avoids an unnecessary API call to /api/auth/session
+      if (data.user) {
+        setUser(data.user)
+      }
 
       // Handle doctor approval pending
-      if (data.user.role === "doctor" && !data.user.approved) {
+      if (data.user.role === "doctor" && !data.user.metadata?.approved) {
         toast({
           title: "Account Pending Approval",
           description: "Your doctor account is pending admin approval. You'll be notified once approved.",

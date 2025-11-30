@@ -9,7 +9,7 @@ import { NextRequest } from 'next/server'
 import { requireAuth, apiError } from '@/lib/auth/api-protection'
 import { appendTranscript } from '@/lib/stt/streaming'
 import { SpeechClient } from '@google-cloud/speech'
-import { rateLimiters } from '@/lib/security/rate-limit'
+import { firestoreRateLimiters } from '@/lib/security/firestore-rate-limit'
 import { addSecurityHeaders } from '@/lib/security/headers'
 import { logError } from '@/lib/security/logging'
 import { handleApiError } from '@/lib/security/error-handler'
@@ -55,14 +55,14 @@ export async function POST(request: NextRequest) {
   const requestId = uuidv4()
   
   try {
-    // Rate limiting
-    const rateLimitResponse = await rateLimiters.api(request)
+    // Require authentication first (needed for user ID)
+    const user = await requireAuth(request)
+    
+    // Rate limiting: 10 STT chunks per second
+    const rateLimitResponse = await firestoreRateLimiters.sttChunks(request, user.id)
     if (rateLimitResponse) {
       return addSecurityHeaders(rateLimitResponse)
     }
-    
-    // Require authentication
-    const user = await requireAuth(request)
 
     // Get session ID and consultation ID from headers
     const sessionId = request.headers.get('X-Session-Id')
@@ -163,6 +163,8 @@ export async function POST(request: NextRequest) {
 
 // TODO: GET endpoint - Get current transcription for a consultation
 export async function GET(request: NextRequest) {
+  const requestId = uuidv4()
+  
   try {
     const user = await requireAuth(request)
 
@@ -170,6 +172,16 @@ export async function GET(request: NextRequest) {
     if (!consultationId) {
       return apiError('Consultation ID required', 400)
     }
+    
+    // Log consultation view
+    const { logConsultationView, getRequestFromNextRequest } = await import('@/lib/security/event-logging')
+    await logConsultationView(
+      user.id,
+      consultationId,
+      user.role,
+      getRequestFromNextRequest(request),
+      requestId
+    )
 
     // Get transcription from Firestore using utility function
     const { getTranscription } = await import('@/lib/stt/streaming')
@@ -207,13 +219,14 @@ export async function DELETE(request: NextRequest) {
   const requestId = uuidv4()
   
   try {
-    // Rate limiting
-    const rateLimitResponse = await rateLimiters.api(request)
+    // Require authentication first (needed for user ID)
+    const user = await requireAuth(request)
+    
+    // Rate limiting: 10 STT chunks per second
+    const rateLimitResponse = await firestoreRateLimiters.sttChunks(request, user.id)
     if (rateLimitResponse) {
       return addSecurityHeaders(rateLimitResponse)
     }
-    
-    await requireAuth(request)
 
     const sessionId = request.headers.get('X-Session-Id')
     if (!sessionId) {

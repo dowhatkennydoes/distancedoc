@@ -30,6 +30,7 @@ export interface UserSession extends AuthUser {
     expires_in: number
     token_type: string
   }
+  clinicId: string // Tenant isolation - clinic identifier
   metadata: {
     doctorId?: string
     patientId?: string
@@ -205,10 +206,10 @@ export async function requireSession(
 
   const { user, session } = validation
 
-  // Get user role from database
+  // Get user role and clinicId from database
   const { data: userMetadata, error: roleError } = await supabase
     .from('user_roles')
-    .select('role, doctor_id, patient_id, approved')
+    .select('role, doctor_id, patient_id, approved, clinic_id')
     .eq('user_id', user.id)
     .single()
 
@@ -231,6 +232,22 @@ export async function requireSession(
     doctor_id: string | null
     patient_id: string | null
     approved: boolean | null
+    clinic_id: string | null
+  }
+
+  // Validate clinicId exists
+  if (!roleData.clinic_id) {
+    logError(
+      'User clinicId not found',
+      undefined,
+      { userId: user.id, pathname: context.pathname },
+      user.id,
+      context.requestId
+    )
+
+    const error: Error & { statusCode?: number } = new Error('User clinic not assigned')
+    error.statusCode = 500
+    throw error
   }
 
   // Log successful session validation
@@ -254,6 +271,7 @@ export async function requireSession(
     email: user.email!,
     role: (roleData.role as UserRole) || 'patient',
     emailVerified: user.email_confirmed_at !== null,
+    clinicId: roleData.clinic_id, // Tenant isolation
     session: {
       access_token: session.access_token,
       refresh_token: session.refresh_token || '',
