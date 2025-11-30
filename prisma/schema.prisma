@@ -1,0 +1,574 @@
+// DistanceDoc Prisma Schema for Cloud SQL PostgreSQL
+// HIPAA-compliant telehealth platform database schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // TODO: Replace with Cloud SQL connection string using GCP connector
+  // Format: postgresql://user:password@/database?host=/cloudsql/PROJECT_ID:REGION:INSTANCE_NAME
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum UserRole {
+  DOCTOR
+  PATIENT
+  ADMIN
+  NURSE
+  STAFF
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+  RESCHEDULED
+}
+
+enum VisitType {
+  VIDEO
+  PHONE
+  IN_PERSON
+  CHAT
+}
+
+enum ConsultationStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum IntakeFormType {
+  INITIAL
+  FOLLOW_UP
+  PRE_VISIT
+  POST_VISIT
+  ANNUAL
+}
+
+enum IntakeFormStatus {
+  DRAFT
+  SUBMITTED
+  REVIEWED
+  ARCHIVED
+}
+
+enum MedicationStatus {
+  ACTIVE
+  DISCONTINUED
+  COMPLETED
+  ON_HOLD
+}
+
+enum LabOrderStatus {
+  PENDING
+  ORDERED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  RESULTS_READY
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+enum NotificationType {
+  APPOINTMENT_REMINDER
+  APPOINTMENT_CONFIRMED
+  APPOINTMENT_CANCELLED
+  MESSAGE_RECEIVED
+  LAB_RESULTS_READY
+  PAYMENT_RECEIVED
+  SYSTEM_ALERT
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+// ============================================================================
+// MODELS
+// ============================================================================
+
+model Doctor {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  licenseNumber  String   @unique
+  specialization String?
+  credentials    String[] // Array of credentials (MD, DO, NP, etc.)
+  npiNumber      String?  @unique // National Provider Identifier
+  bio            String?  @db.Text
+  languages      String[] // Languages spoken
+  timezone       String   @default("America/New_York")
+
+  // Relationships
+  appointments  Appointment[]
+  consultations Consultation[]
+  visitNotes    VisitNote[]
+  labOrders     LabOrder[]
+  messages      MessageThread[] @relation("DoctorMessages")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY doctor_isolation ON doctors
+  //   FOR ALL USING (auth.uid() = "userId" OR auth.role() = 'admin');
+
+  @@index([userId])
+  @@index([licenseNumber])
+  @@index([npiNumber])
+  @@map("doctors")
+}
+
+model Patient {
+  id                 String   @id @default(cuid())
+  userId             String   @unique
+  dateOfBirth        DateTime
+  gender             String?
+  phoneNumber        String?
+  emergencyContact   String?  @db.Text
+  insuranceProvider  String?
+  insuranceMemberId  String?
+  medicalHistory     String?  @db.Text
+  allergies          String[] // Array of allergies
+  currentMedications String[] // Current medications list (free text)
+  address            String?  @db.Text
+
+  // Relationships
+  appointments  Appointment[]
+  consultations Consultation[]
+  visitNotes    VisitNote[]
+  intakeForms   IntakeForm[]
+  medications   Medication[]
+  labOrders     LabOrder[]
+  fileRecords   FileRecord[]
+  messages      MessageThread[] @relation("PatientMessages")
+  payments      Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY patient_isolation ON patients
+  //   FOR ALL USING (auth.uid() = "userId" OR 
+  //     EXISTS (SELECT 1 FROM appointments WHERE patient_id = patients.id 
+  //       AND doctor_id IN (SELECT id FROM doctors WHERE user_id = auth.uid())));
+
+  @@index([userId])
+  @@index([dateOfBirth])
+  @@map("patients")
+}
+
+model Appointment {
+  id          String            @id @default(cuid())
+  doctorId    String
+  patientId   String
+  scheduledAt DateTime
+  duration    Int               @default(30) // minutes
+  status      AppointmentStatus @default(SCHEDULED)
+  visitType   VisitType         @default(VIDEO)
+  reason      String?           @db.Text
+  notes       String?           @db.Text
+  meetingUrl  String? // For video visits
+  meetingId   String? // WebRTC session ID
+
+  // Relationships
+  doctor       Doctor        @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  patient      Patient       @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  consultation Consultation?
+  visitNote    VisitNote?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  cancelledAt DateTime?
+  completedAt DateTime?
+
+  // HIPAA RLS Example:
+  // CREATE POLICY appointment_access ON appointments
+  //   FOR SELECT USING (
+  //     auth.uid() IN (SELECT user_id FROM doctors WHERE id = doctor_id) OR
+  //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id)
+  //   );
+
+  @@index([doctorId])
+  @@index([patientId])
+  @@index([scheduledAt])
+  @@index([status])
+  @@index([doctorId, scheduledAt])
+  @@map("appointments")
+}
+
+model Consultation {
+  id            String             @id @default(cuid())
+  appointmentId String             @unique
+  doctorId      String
+  patientId     String
+  status        ConsultationStatus @default(ACTIVE)
+  startedAt     DateTime?
+  endedAt       DateTime?
+  transcription String?            @db.Text // Speech-to-text transcription
+  recordingUrl  String? // If visit was recorded (with consent)
+
+  // Relationships
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  doctor      Doctor      @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  patient     Patient     @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  visitNote   VisitNote?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY consultation_access ON consultations
+  //   FOR ALL USING (
+  //     auth.uid() IN (SELECT user_id FROM doctors WHERE id = doctor_id) OR
+  //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id)
+  //   );
+
+  @@index([doctorId])
+  @@index([patientId])
+  @@index([appointmentId])
+  @@index([status])
+  @@map("consultations")
+}
+
+model VisitNote {
+  id             String  @id @default(cuid())
+  appointmentId  String  @unique
+  consultationId String? @unique
+  doctorId       String
+  patientId      String
+
+  // SOAP Note structure
+  subjective String? @db.Text // Patient's reported symptoms
+  objective  String? @db.Text // Clinical observations
+  assessment String? @db.Text // Diagnosis/assessment
+  plan       String? @db.Text // Treatment plan
+
+  // AI-generated content
+  aiGenerated Boolean @default(false)
+  aiModel     String? // Which AI model was used (e.g., "gemini-1.5-flash")
+
+  // Additional notes
+  chiefComplaint String?   @db.Text
+  diagnosis      String[] // Array of diagnosis codes (ICD-10)
+  procedures     String[] // Array of procedure codes (CPT)
+  followUpDate   DateTime?
+  signedAt       DateTime? // When doctor signed the note
+  signedBy       String? // Doctor user ID who signed
+
+  // Relationships
+  appointment  Appointment   @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  consultation Consultation? @relation(fields: [consultationId], references: [id], onDelete: SetNull)
+  doctor       Doctor        @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  patient      Patient       @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY visit_note_access ON visit_notes
+  //   FOR SELECT USING (
+  //     auth.uid() IN (SELECT user_id FROM doctors WHERE id = doctor_id) OR
+  //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id)
+  //   );
+  // CREATE POLICY visit_note_modify ON visit_notes
+  //   FOR UPDATE USING (auth.uid() IN (SELECT user_id FROM doctors WHERE id = doctor_id));
+
+  @@index([doctorId])
+  @@index([patientId])
+  @@index([appointmentId])
+  @@index([signedAt])
+  @@map("visit_notes")
+}
+
+model IntakeForm {
+  id        String           @id @default(cuid())
+  patientId String
+  type      IntakeFormType   @default(INITIAL)
+  status    IntakeFormStatus @default(DRAFT)
+
+  // Form data stored as JSON
+  formData Json // Flexible JSON structure for different form types
+
+  // Specific fields for common intake questions
+  chiefComplaint     String?  @db.Text
+  symptoms           String[] // Array of symptoms
+  currentMedications String[] // Current medications
+  allergies          String[] // Known allergies
+  medicalHistory     String?  @db.Text
+  familyHistory      String?  @db.Text
+  socialHistory      String?  @db.Text
+
+  submittedAt DateTime?
+  reviewedAt  DateTime?
+  reviewedBy  String? // Doctor user ID who reviewed
+
+  // Relationships
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY intake_form_access ON intake_forms
+  //   FOR SELECT USING (
+  //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id) OR
+  //     EXISTS (SELECT 1 FROM appointments WHERE patient_id = patient_id 
+  //       AND doctor_id IN (SELECT id FROM doctors WHERE user_id = auth.uid()))
+  //   );
+
+  @@index([patientId])
+  @@index([type])
+  @@index([status])
+  @@index([submittedAt])
+  @@map("intake_forms")
+}
+
+model Medication {
+  id           String           @id @default(cuid())
+  patientId    String
+  name         String
+  dosage       String? // e.g., "10mg", "1 tablet"
+  frequency    String? // e.g., "twice daily", "as needed"
+  route        String? // e.g., "oral", "topical", "injection"
+  startDate    DateTime?
+  endDate      DateTime?
+  status       MedicationStatus @default(ACTIVE)
+  prescribedBy String? // Doctor user ID
+  instructions String?          @db.Text
+  pharmacy     String?
+  refills      Int              @default(0)
+
+  // Relationships
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY medication_access ON medications
+  //   FOR SELECT USING (
+  //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id) OR
+  //     EXISTS (SELECT 1 FROM appointments WHERE patient_id = patient_id 
+  //       AND doctor_id IN (SELECT id FROM doctors WHERE user_id = auth.uid()))
+  //   );
+
+  @@index([patientId])
+  @@index([status])
+  @@index([startDate])
+  @@map("medications")
+}
+
+model LabOrder {
+  id          String         @id @default(cuid())
+  patientId   String
+  doctorId    String
+  orderNumber String         @unique
+  tests       String[] // Array of test names/codes
+  status      LabOrderStatus @default(PENDING)
+  orderedAt   DateTime       @default(now())
+  completedAt DateTime?
+  results     Json? // Lab results stored as JSON
+  resultsUrl  String? // Link to external lab results
+  notes       String?        @db.Text
+
+  // Relationships
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctor  Doctor  @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY lab_order_access ON lab_orders
+  //   FOR SELECT USING (
+  //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id) OR
+  //     auth.uid() IN (SELECT user_id FROM doctors WHERE id = doctor_id)
+  //   );
+
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([orderNumber])
+  @@index([status])
+  @@index([orderedAt])
+  @@map("lab_orders")
+}
+
+model FileRecord {
+  id          String  @id @default(cuid())
+  patientId   String
+  fileName    String
+  fileType    String // MIME type
+  fileSize    Int // bytes
+  storageUrl  String // GCS bucket URL
+  storagePath String // Path in Cloud Storage
+  category    String? // e.g., "medical_record", "lab_result", "prescription", "image"
+  description String? @db.Text
+  uploadedBy  String? // User ID who uploaded
+  encrypted   Boolean @default(false)
+
+  // Relationships
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY file_record_access ON file_records
+  //   FOR SELECT USING (
+  //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id) OR
+  //     EXISTS (SELECT 1 FROM appointments WHERE patient_id = patient_id 
+  //       AND doctor_id IN (SELECT id FROM doctors WHERE user_id = auth.uid()))
+  //   );
+
+  @@index([patientId])
+  @@index([category])
+  @@index([createdAt])
+  @@map("file_records")
+}
+
+model MessageThread {
+  id              String   @id @default(cuid())
+  doctorId        String
+  patientId       String
+  subject         String?
+  lastMessageAt   DateTime @default(now())
+  unreadByDoctor  Boolean  @default(false)
+  unreadByPatient Boolean  @default(false)
+  archived        Boolean  @default(false)
+
+  // Relationships
+  doctor   Doctor    @relation("DoctorMessages", fields: [doctorId], references: [id], onDelete: Cascade)
+  patient  Patient   @relation("PatientMessages", fields: [patientId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY message_thread_access ON message_threads
+  //   FOR SELECT USING (
+  //     auth.uid() IN (SELECT user_id FROM doctors WHERE id = doctor_id) OR
+  //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id)
+  //   );
+
+  @@index([doctorId])
+  @@index([patientId])
+  @@index([lastMessageAt])
+  @@index([archived])
+  @@map("message_threads")
+}
+
+model Message {
+  id          String    @id @default(cuid())
+  threadId    String
+  senderId    String // User ID of sender
+  senderRole  UserRole // DOCTOR or PATIENT
+  content     String    @db.Text
+  attachments String[] // Array of file record IDs
+  read        Boolean   @default(false)
+  readAt      DateTime?
+
+  // Relationships
+  thread MessageThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY message_access ON messages
+  //   FOR SELECT USING (
+  //     EXISTS (SELECT 1 FROM message_threads WHERE id = thread_id 
+  //       AND (doctor_id IN (SELECT id FROM doctors WHERE user_id = auth.uid())
+  //         OR patient_id IN (SELECT id FROM patients WHERE user_id = auth.uid())))
+  //   );
+
+  @@index([threadId])
+  @@index([senderId])
+  @@index([createdAt])
+  @@map("messages")
+}
+
+model Payment {
+  id              String        @id @default(cuid())
+  patientId       String
+  appointmentId   String? // Optional link to appointment
+  stripePaymentId String?       @unique // Stripe payment intent ID
+  amount          Decimal       @db.Decimal(10, 2) // Amount in dollars
+  currency        String        @default("usd")
+  status          PaymentStatus @default(PENDING)
+  description     String?       @db.Text
+  receiptUrl      String? // Link to receipt PDF
+
+  // Relationships
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  paidAt    DateTime?
+
+  // HIPAA RLS Example:
+  // CREATE POLICY payment_access ON payments
+  //   FOR SELECT USING (
+  //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id) OR
+  //     auth.role() = 'admin'
+  //   );
+
+  @@index([patientId])
+  @@index([appointmentId])
+  @@index([stripePaymentId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("payments")
+}
+
+model Notification {
+  id          String             @id @default(cuid())
+  userId      String // User ID (doctor or patient)
+  userRole    UserRole // DOCTOR or PATIENT
+  type        NotificationType
+  status      NotificationStatus @default(PENDING)
+  title       String
+  message     String             @db.Text
+  data        Json? // Additional data as JSON
+  read        Boolean            @default(false)
+  readAt      DateTime?
+  sentAt      DateTime?
+  deliveredAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // HIPAA RLS Example:
+  // CREATE POLICY notification_access ON notifications
+  //   FOR SELECT USING (auth.uid() = user_id);
+
+  @@index([userId])
+  @@index([userRole])
+  @@index([type])
+  @@index([status])
+  @@index([read])
+  @@index([createdAt])
+  @@map("notifications")
+}

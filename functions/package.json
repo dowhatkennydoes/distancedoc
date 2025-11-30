@@ -1,0 +1,29 @@
+{
+  "name": "distancedoc-functions",
+  "version": "1.0.0",
+  "description": "Google Cloud Functions for DistanceDoc",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "gcloud functions deploy",
+    "logs": "gcloud functions logs read",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^8.0.0",
+    "@google-cloud/storage": "^7.11.0",
+    "@google-cloud/scheduler": "^3.0.0",
+    "@google-cloud/functions-framework": "^3.3.0",
+    "@prisma/client": "^5.19.0",
+    "@sendgrid/mail": "^8.1.0",
+    "twilio": "^5.0.0",
+    "stripe": "^14.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "typescript": "^5.5.4"
+  }
+}
+

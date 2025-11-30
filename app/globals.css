@@ -1,0 +1,139 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import "react-day-picker/dist/style.css";
+
+@layer base {
+  :root {
+    /* Medical Theme - Clean Whites & Soft Blues */
+    --background: 0 0% 100%;
+    --foreground: 215 25% 27%;
+    --card: 0 0% 100%;
+    --card-foreground: 215 25% 27%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 215 25% 27%;
+    --primary: 210 100% 50%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 210 40% 96%;
+    --secondary-foreground: 215 25% 27%;
+    --muted: 210 30% 98%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 210 60% 95%;
+    --accent-foreground: 215 25% 27%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 210 20% 92%;
+    --input: 210 20% 92%;
+    --ring: 210 100% 50%;
+    --radius: 0.75rem;
+    
+    /* Medical Theme Additional Colors */
+    --medical-blue: 210 100% 50%;
+    --medical-blue-light: 210 60% 95%;
+    --medical-blue-dark: 210 80% 35%;
+    --medical-teal: 180 60% 50%;
+    --medical-teal-light: 180 40% 96%;
+  }
+
+  .dark {
+    --background: 215 25% 15%;
+    --foreground: 210 20% 95%;
+    --card: 215 25% 18%;
+    --card-foreground: 210 20% 95%;
+    --popover: 215 25% 18%;
+    --popover-foreground: 210 20% 95%;
+    --primary: 210 100% 60%;
+    --primary-foreground: 215 25% 15%;
+    --secondary: 215 20% 25%;
+    --secondary-foreground: 210 20% 95%;
+    --muted: 215 20% 25%;
+    --muted-foreground: 215 10% 65%;
+    --accent: 215 20% 25%;
+    --accent-foreground: 210 20% 95%;
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 210 20% 95%;
+    --border: 215 20% 25%;
+    --input: 215 20% 25%;
+    --ring: 210 100% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  
+  body {
+    @apply bg-background text-foreground antialiased;
+    background-image: 
+      radial-gradient(at 0% 0%, hsl(210 60% 98% / 0.3) 0px, transparent 50%),
+      radial-gradient(at 100% 100%, hsl(180 40% 96% / 0.2) 0px, transparent 50%);
+  }
+  
+  /* Typography Styles */
+  h1 {
+    @apply text-4xl font-bold tracking-tight text-foreground;
+  }
+  
+  h2 {
+    @apply text-3xl font-semibold tracking-tight text-foreground;
+  }
+  
+  h3 {
+    @apply text-2xl font-semibold tracking-tight text-foreground;
+  }
+  
+  h4 {
+    @apply text-xl font-semibold tracking-tight text-foreground;
+  }
+  
+  h5 {
+    @apply text-lg font-semibold text-foreground;
+  }
+  
+  h6 {
+    @apply text-base font-semibold text-foreground;
+  }
+  
+  p {
+    @apply text-base leading-7 text-foreground/90;
+  }
+  
+  /* Responsive Container */
+  .container-responsive {
+    @apply w-full mx-auto px-4 sm:px-6 lg:px-8;
+    max-width: 100%;
+  }
+  
+  @media (min-width: 640px) {
+    .container-responsive {
+      max-width: 640px;
+    }
+  }
+  
+  @media (min-width: 768px) {
+    .container-responsive {
+      max-width: 768px;
+    }
+  }
+  
+  @media (min-width: 1024px) {
+    .container-responsive {
+      max-width: 1024px;
+    }
+  }
+  
+  @media (min-width: 1280px) {
+    .container-responsive {
+      max-width: 1280px;
+    }
+  }
+  
+  @media (min-width: 1536px) {
+    .container-responsive {
+      max-width: 1400px;
+    }
+  }
+}
+
