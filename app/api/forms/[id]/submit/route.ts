@@ -4,22 +4,13 @@
 
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
-import { requireSession, requireRole, requireOwnership, getGuardContext } from '@/lib/auth/guards'
-import { verifyClinicAccess, withClinicScope } from '@/lib/auth/tenant-scope'
+import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
+import { ensureOwnershipOrDoctor } from '@/lib/auth/patient-access'
+import { enforceTenant } from '@/lib/auth/tenant'
+import { validate } from '@/lib/validation'
+import { intakeResponseSchema } from '@/lib/validation/schemas'
 import { prisma } from '@/db/prisma'
-import { z } from 'zod'
 import type { FormResponse, ConsultationIntakeData } from '@/lib/forms/types'
-
-// Form submission schema
-const SubmitFormSchema = z.object({
-  consultationId: z.string(),
-  responses: z.array(
-    z.object({
-      questionId: z.string(),
-      value: z.union([z.string(), z.array(z.string()), z.number(), z.boolean()]),
-    })
-  ),
-})
 
 // POST - Submit form responses
 export async function POST(
@@ -36,20 +27,38 @@ export async function POST(
     requireRole(session, ['patient', 'doctor'], context)
 
     const body = await request.json()
-    const validatedData = SubmitFormSchema.parse(body)
+    const validatedData = validate(intakeResponseSchema, body, context.requestId)
 
-    // Get form to validate structure
+    // OPTIMIZED: Get form with clinicId validation and minimal SELECT
     const form = await prisma.intakeForm.findUnique({
       where: { id: params.id },
+      select: {
+        id: true,
+        clinicId: true,
+        patientId: true,
+        type: true,
+        status: true,
+        formData: true,
+      },
     })
 
     if (!form) {
       return apiError('Form not found', 404, context.requestId)
     }
 
+    // SECURITY: Enforce tenant isolation
+    if (form.clinicId !== session.clinicId) {
+      return apiError('Forbidden: Form belongs to different clinic', 403, context.requestId)
+    }
+
     // Verify consultation exists and user has access (with clinic scoping)
+    const consultationId = validatedData.consultationId || validatedData.appointmentId
+    if (!consultationId) {
+      return apiError('Consultation ID or Appointment ID is required', 400, context.requestId)
+    }
+    
     const consultation = await prisma.consultation.findUnique({
-      where: { id: validatedData.consultationId },
+      where: { id: consultationId },
       include: {
         patient: {
           select: { clinicId: true },
@@ -64,37 +73,11 @@ export async function POST(
       return apiError('Consultation not found', 404, context.requestId)
     }
 
-    // Verify clinic access
-    verifyClinicAccess(
-      consultation.patient.clinicId,
-      session.clinicId,
-      'consultation',
-      validatedData.consultationId,
-      context.requestId
-    )
+    // SECURITY: Enforce tenant isolation
+    enforceTenant(consultation.clinicId, session.clinicId, context)
 
-    // Verify ownership - patient or doctor must own the consultation
-    if (session.role === 'patient') {
-      const patient = await prisma.patient.findUnique({
-        where: { userId: session.id },
-        select: { id: true },
-      })
-      if (patient && consultation.patientId === patient.id) {
-        await requireOwnership(session.id, patient.id, session.role, context)
-      } else {
-        return apiError('Unauthorized', 403, context.requestId)
-      }
-    } else if (session.role === 'doctor') {
-      const doctor = await prisma.doctor.findUnique({
-        where: { userId: session.id },
-        select: { id: true },
-      })
-      if (doctor && consultation.doctorId === doctor.id) {
-        // Doctor has access through relationship
-      } else {
-        return apiError('Unauthorized', 403, context.requestId)
-      }
-    }
+    // Verify user has access to this patient's form
+    await ensureOwnershipOrDoctor(session, consultation.patientId, context)
 
     // Prepare intake data
     const intakeData: ConsultationIntakeData = {
@@ -103,9 +86,7 @@ export async function POST(
       submittedAt: new Date(),
     }
 
-    // Update consultation with intake data
-    // Store in a JSON field - you may want to add intakeData to Consultation model
-    // For now, we'll update the related IntakeForm with the consultation reference
+    // Update intake form with responses and status
     await prisma.intakeForm.update({
       where: { id: params.id },
       data: {
@@ -113,22 +94,17 @@ export async function POST(
         submittedAt: new Date(),
         formData: {
           ...(form.formData as any),
-          consultationId: validatedData.consultationId,
+          consultationId: consultationId,
           responses: validatedData.responses,
           submittedAt: new Date().toISOString(),
         },
-      },
-    })
-
-    // Also create/update a record linking consultation to intake data
-    // You might want to add this to the Consultation model or create a separate table
-
-    // Also update intake form status
-    await prisma.intakeForm.update({
-      where: { id: params.id },
-      data: {
-        status: 'SUBMITTED',
-        submittedAt: new Date(),
+        chiefComplaint: validatedData.chiefComplaint,
+        symptoms: validatedData.symptoms,
+        currentMedications: validatedData.currentMedications,
+        allergies: validatedData.allergies,
+        medicalHistory: validatedData.medicalHistory,
+        familyHistory: validatedData.familyHistory,
+        socialHistory: validatedData.socialHistory,
       },
     })
 
@@ -141,10 +117,6 @@ export async function POST(
       context.requestId
     )
   } catch (error: any) {
-    if (error instanceof z.ZodError) {
-      return apiError(`Validation error: ${error.errors.map((e) => e.message).join(', ')}`, 400, context.requestId)
-    }
-    
     const statusCode = (error as Error & { statusCode?: number }).statusCode || 500
     const message = error.message || 'Internal server error'
     

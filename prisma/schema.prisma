@@ -105,6 +105,16 @@ enum NotificationStatus {
   FAILED
 }
 
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
 // ============================================================================
 // MODELS
 // ============================================================================
@@ -112,7 +122,7 @@ enum NotificationStatus {
 model Doctor {
   id             String   @id @default(cuid())
   userId         String   @unique
-  clinicId       String   // Tenant isolation - clinic identifier
+  clinicId       String // Tenant isolation - clinic identifier
   licenseNumber  String   @unique
   specialization String?
   credentials    String[] // Array of credentials (MD, DO, NP, etc.)
@@ -127,6 +137,8 @@ model Doctor {
   visitNotes    VisitNote[]
   labOrders     LabOrder[]
   messages      MessageThread[] @relation("DoctorMessages")
+  availability  DoctorAvailability[]
+  dashboardPreview DoctorDashboardPreview?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -143,20 +155,92 @@ model Doctor {
   @@map("doctors")
 }
 
+model DoctorAvailability {
+  id        String    @id @default(cuid())
+  doctorId  String
+  clinicId  String // Tenant isolation - clinic identifier
+  dayOfWeek DayOfWeek
+  startTime String // Format: "HH:mm" (e.g., "09:00")
+  endTime   String // Format: "HH:mm" (e.g., "17:00")
+
+  // Relationships
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Indexes for efficient queries
+  @@index([doctorId])
+  @@index([clinicId])
+  @@index([dayOfWeek])
+  @@index([clinicId, doctorId])
+  @@index([doctorId, dayOfWeek])
+  @@map("doctor_availability")
+}
+
+model DoctorDashboardPreview {
+  id        String   @id @default(cuid())
+  doctorId  String   @unique
+  clinicId  String   // Tenant isolation - clinic identifier
+
+  // Dashboard Metrics
+  totalPatients         Int @default(0)
+  upcomingAppointments  Int @default(0)
+  unresolvedMessages    Int @default(0)
+  pendingLabs           Int @default(0)
+
+  // Relationships
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Indexes for efficient queries
+  @@index([doctorId])
+  @@index([clinicId])
+  @@index([clinicId, doctorId])
+  @@map("doctor_dashboard_preview")
+}
+
 model Patient {
-  id                 String   @id @default(cuid())
-  userId             String   @unique
-  clinicId           String   // Tenant isolation - clinic identifier
-  dateOfBirth        DateTime
-  gender             String?
-  phoneNumber        String?
-  emergencyContact   String?  @db.Text
-  insuranceProvider  String?
-  insuranceMemberId  String?
-  medicalHistory     String?  @db.Text
-  allergies          String[] // Array of allergies
-  currentMedications String[] // Current medications list (free text)
-  address            String?  @db.Text
+  id       String @id @default(cuid())
+  userId   String @unique
+  clinicId String // Tenant isolation - clinic identifier
+
+  // Basic Demographics
+  firstName      String
+  lastName       String
+  dateOfBirth    DateTime
+  sex            String
+  genderIdentity String?
+
+  // Contact Information
+  phone String?
+  email String?
+
+  // Address
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  postalCode   String?
+
+  // Emergency & Pharmacy
+  emergencyContact  String? @db.Text
+  preferredPharmacy String?
+
+  // Preferences & Language
+  preferredLanguage String?
+
+  // Insurance
+  insuranceProvider String?
+  insuranceMemberId String?
+
+  // Medical History - Stored as JSON for flexibility
+  allergies              Json? // Structured allergy data
+  currentMedicationsData Json? // Structured current medication data
+  pastMedicalHistory     Json? // Structured medical history
+  familyHistory          Json? // Structured family history
 
   // Relationships
   appointments  Appointment[]
@@ -180,8 +264,16 @@ model Patient {
 
   @@index([userId])
   @@index([clinicId])
+  @@index([email])
+  @@index([lastName])
+  @@index([createdAt])
   @@index([dateOfBirth])
+  @@index([lastName, firstName])
+  @@index([phone])
   @@index([clinicId, userId])
+  @@index([clinicId, lastName, firstName])
+  @@index([clinicId, email])
+  @@index([clinicId, createdAt])
   @@map("patients")
 }
 
@@ -189,7 +281,7 @@ model Appointment {
   id          String            @id @default(cuid())
   doctorId    String
   patientId   String
-  clinicId   String            // Tenant isolation - clinic identifier
+  clinicId    String // Tenant isolation - clinic identifier
   scheduledAt DateTime
   duration    Int               @default(30) // minutes
   status      AppointmentStatus @default(SCHEDULED)
@@ -224,7 +316,11 @@ model Appointment {
   @@index([status])
   @@index([clinicId, doctorId])
   @@index([clinicId, patientId])
+  @@index([clinicId, scheduledAt])
   @@index([doctorId, scheduledAt])
+  @@index([patientId, scheduledAt])
+  @@index([clinicId, doctorId, scheduledAt])
+  @@index([clinicId, patientId, scheduledAt])
   @@map("appointments")
 }
 
@@ -233,6 +329,7 @@ model Consultation {
   appointmentId String             @unique
   doctorId      String
   patientId     String
+  clinicId      String // Tenant isolation - clinic identifier
   status        ConsultationStatus @default(ACTIVE)
   startedAt     DateTime?
   endedAt       DateTime?
@@ -255,10 +352,14 @@ model Consultation {
   //     auth.uid() IN (SELECT user_id FROM patients WHERE id = patient_id)
   //   );
 
-  @@index([doctorId])
-  @@index([patientId])
   @@index([appointmentId])
+  @@index([clinicId])
+  @@index([patientId])
+  @@index([doctorId])
   @@index([status])
+  @@index([clinicId, appointmentId])
+  @@index([clinicId, patientId])
+  @@index([clinicId, doctorId])
   @@map("consultations")
 }
 
@@ -268,7 +369,7 @@ model VisitNote {
   consultationId String? @unique
   doctorId       String
   patientId      String
-  clinicId      String  // Tenant isolation - clinic identifier
+  clinicId       String // Tenant isolation - clinic identifier
 
   // SOAP Note structure
   subjective String? @db.Text // Patient's reported symptoms
@@ -319,6 +420,7 @@ model VisitNote {
 model IntakeForm {
   id        String           @id @default(cuid())
   patientId String
+  clinicId  String // Tenant isolation - clinic identifier
   type      IntakeFormType   @default(INITIAL)
   status    IntakeFormStatus @default(DRAFT)
 
@@ -353,15 +455,18 @@ model IntakeForm {
   //   );
 
   @@index([patientId])
+  @@index([clinicId])
   @@index([type])
   @@index([status])
   @@index([submittedAt])
+  @@index([clinicId, patientId])
   @@map("intake_forms")
 }
 
 model Medication {
   id           String           @id @default(cuid())
   patientId    String
+  clinicId     String // Tenant isolation - clinic identifier
   name         String
   dosage       String? // e.g., "10mg", "1 tablet"
   frequency    String? // e.g., "twice daily", "as needed"
@@ -389,8 +494,10 @@ model Medication {
   //   );
 
   @@index([patientId])
+  @@index([clinicId])
   @@index([status])
   @@index([startDate])
+  @@index([clinicId, patientId])
   @@map("medications")
 }
 
@@ -398,6 +505,7 @@ model LabOrder {
   id          String         @id @default(cuid())
   patientId   String
   doctorId    String
+  clinicId    String // Tenant isolation - clinic identifier
   orderNumber String         @unique
   tests       String[] // Array of test names/codes
   status      LabOrderStatus @default(PENDING)
@@ -423,24 +531,28 @@ model LabOrder {
 
   @@index([patientId])
   @@index([doctorId])
+  @@index([clinicId])
   @@index([orderNumber])
   @@index([status])
   @@index([orderedAt])
+  @@index([clinicId, patientId])
+  @@index([clinicId, doctorId])
   @@map("lab_orders")
 }
 
 model FileRecord {
-  id          String  @id @default(cuid())
-  patientId   String
-  fileName    String
-  fileType    String // MIME type
-  fileSize    Int // bytes
-  storageUrl  String // GCS bucket URL
-  storagePath String // Path in Cloud Storage
-  category    String? // e.g., "medical_record", "lab_result", "prescription", "image"
-  description String? @db.Text
-  uploadedBy  String? // User ID who uploaded
-  encrypted   Boolean @default(false)
+  id              String  @id @default(cuid())
+  patientId       String // Patient who owns this file
+  clinicId        String // Tenant isolation - clinic identifier
+  createdByUserId String // User ID who created/uploaded the file (required for audit trail)
+  fileName        String
+  fileType        String // MIME type
+  fileSize        Int // bytes
+  storageUrl      String // GCS bucket URL
+  storagePath     String // Path in Cloud Storage
+  category        String? // e.g., "medical_record", "lab_result", "prescription", "image"
+  description     String? @db.Text
+  encrypted       Boolean @default(false)
 
   // Relationships
   patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
@@ -457,8 +569,14 @@ model FileRecord {
   //   );
 
   @@index([patientId])
+  @@index([clinicId])
+  @@index([createdByUserId])
   @@index([category])
   @@index([createdAt])
+  @@index([clinicId, patientId])
+  @@index([clinicId, createdByUserId])
+  @@index([patientId, clinicId])
+  @@index([clinicId, patientId, createdAt])
   @@map("file_records")
 }
 
@@ -466,7 +584,7 @@ model MessageThread {
   id              String   @id @default(cuid())
   doctorId        String
   patientId       String
-  clinicId       String   // Tenant isolation - clinic identifier
+  clinicId        String // Tenant isolation - clinic identifier
   subject         String?
   lastMessageAt   DateTime @default(now())
   unreadByDoctor  Boolean  @default(false)
@@ -495,6 +613,8 @@ model MessageThread {
   @@index([archived])
   @@index([clinicId, doctorId])
   @@index([clinicId, patientId])
+  @@index([doctorId, patientId])
+  @@index([clinicId, doctorId, patientId])
   @@map("message_threads")
 }
 
@@ -531,6 +651,7 @@ model Message {
 model Payment {
   id              String        @id @default(cuid())
   patientId       String
+  clinicId        String // Tenant isolation - clinic identifier
   appointmentId   String? // Optional link to appointment
   stripePaymentId String?       @unique // Stripe payment intent ID
   amount          Decimal       @db.Decimal(10, 2) // Amount in dollars
@@ -554,10 +675,12 @@ model Payment {
   //   );
 
   @@index([patientId])
+  @@index([clinicId])
   @@index([appointmentId])
   @@index([stripePaymentId])
   @@index([status])
   @@index([createdAt])
+  @@index([clinicId, patientId])
   @@map("payments")
 }
 

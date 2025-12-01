@@ -16,8 +16,9 @@
  * - File downloads
  */
 
-import { getFirestore } from '@/lib/gcp/gcp-firestore'
-import { Firestore } from '@google-cloud/firestore'
+// Temporarily disabled due to Next.js build issues with node: imports
+// import { getFirestore } from '@/lib/gcp/gcp-firestore'
+// import { Firestore } from '@google-cloud/firestore'
 import { redactPHI } from './sanitize'
 import { v4 as uuidv4 } from 'uuid'
 
@@ -232,14 +233,14 @@ export async function logEvent(
     try {
       const safeMetadata = createSafeMetadata(eventName, metadata, userId, request, requestId)
       
-      // Store in Firestore audit_logs collection
-      const firestore = getFirestore()
-      const auditLogsRef = firestore.collection('audit_logs')
-      
-      await auditLogsRef.add({
-        ...safeMetadata,
-        createdAt: Firestore.FieldValue.serverTimestamp(),
-      })
+      // TODO: Store in Firestore audit_logs collection when implemented
+      // const firestore = getFirestore()
+      // const auditLogsRef = firestore.collection('audit_logs')
+      // 
+      // await auditLogsRef.add({
+      //   ...safeMetadata,
+      //   createdAt: Firestore.FieldValue.serverTimestamp(),
+      // })
       
       // Also log to console in development
       if (process.env.NODE_ENV === 'development') {

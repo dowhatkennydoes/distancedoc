@@ -5,9 +5,11 @@
 
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
-import { requireSession, requireRole, requireOwnership, getGuardContext } from '@/lib/auth/guards'
+import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
+import { ensureOwnershipOrDoctor } from '@/lib/auth/patient-access'
 import { withClinicScope } from '@/lib/auth/tenant-scope'
 import { prisma } from '@/db/prisma'
+import { appointmentSelect } from '@/lib/db/selects'
 
 // GET - Get patient appointments
 export async function GET(request: NextRequest) {
@@ -17,30 +19,42 @@ export async function GET(request: NextRequest) {
     // Require valid session
     const session = await requireSession(request)
     
-    // Require patient role
-    requireRole(session, 'patient', context)
+    // Allow patient or doctor role
+    requireRole(session, ['patient', 'doctor'], context)
 
-    // Get patient record with clinic scoping
-    const patient = await prisma.patient.findUnique({
-      where: { 
-        userId: session.id,
-        clinicId: session.clinicId, // Tenant isolation
-      },
-      select: { id: true, clinicId: true },
-    })
+    // Get patientId from query params if doctor, otherwise from session
+    const patientIdParam = request.nextUrl.searchParams.get('patientId')
+    let patientId: string
 
-    if (!patient) {
-      return apiError('Patient profile not found', 404, context.requestId)
+    if (session.role === 'doctor' && patientIdParam) {
+      // Doctor accessing specific patient's appointments
+      await ensureOwnershipOrDoctor(session, patientIdParam, context)
+      patientId = patientIdParam
+    } else if (session.role === 'patient') {
+      // Patient accessing their own appointments
+      const patient = await prisma.patient.findUnique({
+        where: { 
+          userId: session.id,
+          clinicId: session.clinicId,
+        },
+        select: { id: true },
+      })
+
+      if (!patient) {
+        return apiError('Patient profile not found', 404, context.requestId)
+      }
+
+      await ensureOwnershipOrDoctor(session, patient.id, context)
+      patientId = patient.id
+    } else {
+      return apiError('Invalid access', 403, context.requestId)
     }
-
-    // Verify ownership - patient can only access their own appointments
-    await requireOwnership(session.id, patient.id, session.role, context)
 
     const status = request.nextUrl.searchParams.get('status')
     const upcoming = request.nextUrl.searchParams.get('upcoming') === 'true'
 
     const where: any = {
-      patientId: patient.id,
+      patientId,
     }
 
     if (status) {
@@ -50,19 +64,23 @@ export async function GET(request: NextRequest) {
       where.scheduledAt = { gte: new Date() }
     }
 
-    // Get appointments with clinic scoping
+    // Get appointments with clinic scoping using safe select
     const appointments = await prisma.appointment.findMany({
       where: withClinicScope(session.clinicId, where),
-      include: {
+      select: {
+        id: true,
+        scheduledAt: true,
+        duration: true,
+        status: true,
+        visitType: true,
+        reason: true,
+        meetingUrl: true,
+        createdAt: true,
         doctor: {
-          include: {
-            user: {
-              select: {
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
-            },
+          select: {
+            id: true,
+            specialization: true,
+            credentials: true,
           },
         },
         visitNote: {
@@ -74,24 +92,8 @@ export async function GET(request: NextRequest) {
       orderBy: upcoming ? { scheduledAt: 'asc' } : { scheduledAt: 'desc' },
     })
 
-    // Format response
-    const formatted = appointments.map((apt) => ({
-      id: apt.id,
-      scheduledAt: apt.scheduledAt,
-      duration: apt.duration,
-      status: apt.status,
-      visitType: apt.visitType,
-      reason: apt.reason,
-      meetingUrl: apt.meetingUrl,
-      doctor: {
-        id: apt.doctor.id,
-        name: `${apt.doctor.user.firstName || ''} ${apt.doctor.user.lastName || ''}`.trim() || apt.doctor.user.email,
-        specialization: apt.doctor.specialization,
-      },
-      visitNote: apt.visitNote ? { id: apt.visitNote.id } : undefined,
-    }))
-
-    return apiSuccess(formatted, 200, context.requestId)
+    // Format response (already sanitized by select)
+    return apiSuccess(appointments, 200, context.requestId)
   } catch (error: any) {
     const statusCode = (error as Error & { statusCode?: number }).statusCode || 500
     const message = error.message || 'Internal server error'

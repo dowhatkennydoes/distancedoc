@@ -6,14 +6,20 @@
 // TODO: Stateless and scalable implementation
 
 import { NextRequest } from 'next/server'
-import { requireAuth, apiError } from '@/lib/auth/api-protection'
+import { apiError } from '@/lib/auth/api-protection'
+import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
+import { ensureOwnershipOrDoctor, requireDoctorAccessToPatient } from '@/lib/auth/patient-access'
+import { enforceTenant } from '@/lib/auth/tenant'
 import { appendTranscript } from '@/lib/stt/streaming'
 import { SpeechClient } from '@google-cloud/speech'
 import { firestoreRateLimiters } from '@/lib/security/firestore-rate-limit'
 import { addSecurityHeaders } from '@/lib/security/headers'
 import { logError } from '@/lib/security/logging'
 import { handleApiError } from '@/lib/security/error-handler'
+import { logTranscriptAccess } from '@/lib/logging/audit'
+import { prisma } from '@/db/prisma'
 import { v4 as uuidv4 } from 'uuid'
+import { z } from 'zod'
 
 // TODO: Initialize Speech-to-Text client (reused across requests)
 let speechClient: SpeechClient | null = null
@@ -50,16 +56,18 @@ interface StreamSession {
   createdAt: Date
 }
 
-// TODO: POST endpoint - Start streaming session or send audio chunk
+// POST endpoint - Start streaming session or send audio chunk
 export async function POST(request: NextRequest) {
-  const requestId = uuidv4()
+  const context = getGuardContext(request)
+  const requestId = context.requestId
   
   try {
-    // Require authentication first (needed for user ID)
-    const user = await requireAuth(request)
+    // SECURITY: Require valid session and role
+    const session = await requireSession(request)
+    requireRole(session, ['doctor', 'patient'], context)
     
     // Rate limiting: 10 STT chunks per second
-    const rateLimitResponse = await firestoreRateLimiters.sttChunks(request, user.id)
+    const rateLimitResponse = await firestoreRateLimiters.sttChunks(request, session.id)
     if (rateLimitResponse) {
       return addSecurityHeaders(rateLimitResponse)
     }
@@ -69,11 +77,66 @@ export async function POST(request: NextRequest) {
     const consultationId = request.headers.get('X-Consultation-Id')
 
     if (!sessionId) {
-      return apiError('Session ID required', 400)
+      return apiError('Session ID required', 400, context.requestId)
     }
 
     if (!consultationId) {
-      return apiError('Consultation ID required', 400)
+      return apiError('Consultation ID required', 400, context.requestId)
+    }
+
+    // SECURITY: Validate consultation exists and user has access
+    const consultation = await prisma.consultation.findUnique({
+      where: { id: consultationId },
+      include: {
+        patient: {
+          select: {
+            id: true,
+            clinicId: true,
+          },
+        },
+        doctor: {
+          select: {
+            id: true,
+            clinicId: true,
+          },
+        },
+      },
+    })
+
+    if (!consultation) {
+      return apiError('Consultation not found', 404, context.requestId)
+    }
+
+    // SECURITY: Enforce tenant isolation
+    enforceTenant(consultation.clinicId, session.clinicId, context)
+
+    // SECURITY: Verify user has access to this consultation
+    if (session.role === 'patient') {
+      // Patient must own the consultation
+      const patient = await prisma.patient.findUnique({
+        where: {
+          userId: session.id,
+          clinicId: session.clinicId,
+        },
+        select: { id: true },
+      })
+
+      if (!patient || patient.id !== consultation.patientId) {
+        return apiError('Unauthorized: You do not have access to this consultation', 403, context.requestId)
+      }
+    } else if (session.role === 'doctor') {
+      // Doctor must be assigned to the consultation
+      const doctor = await prisma.doctor.findUnique({
+        where: {
+          userId: session.id,
+          clinicId: session.clinicId,
+        },
+        select: { id: true },
+      })
+
+      if (!doctor || doctor.id !== consultation.doctorId) {
+        return apiError('Unauthorized: You do not have access to this consultation', 403, context.requestId)
+      }
     }
 
     // Get audio chunk from request body
@@ -123,14 +186,14 @@ export async function POST(request: NextRequest) {
             // Store transcript in Firestore using utility function
             await appendTranscript(consultationId, transcript, isFinal, sessionId)
           } catch (error) {
-            logError('Error storing transcript in Firestore', error as Error, undefined, user.id, requestId)
+            logError('Error storing transcript in Firestore', error as Error, undefined, session.id, requestId)
           }
         }
       }
     })
 
     recognizeStream.on('error', (error) => {
-      logError('Speech-to-Text streaming error', error as Error, undefined, user.id, requestId)
+      logError('Speech-to-Text streaming error', error as Error, undefined, session.id, requestId)
     })
 
     // Send audio chunk to recognizer
@@ -161,27 +224,86 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// TODO: GET endpoint - Get current transcription for a consultation
+// GET endpoint - Get current transcription for a consultation
 export async function GET(request: NextRequest) {
-  const requestId = uuidv4()
+  const context = getGuardContext(request)
+  const requestId = context.requestId
   
   try {
-    const user = await requireAuth(request)
+    // SECURITY: Require valid session and role
+    const session = await requireSession(request)
+    requireRole(session, ['doctor', 'patient'], context)
 
     const consultationId = request.nextUrl.searchParams.get('consultationId')
     if (!consultationId) {
-      return apiError('Consultation ID required', 400)
+      return apiError('Consultation ID required', 400, context.requestId)
+    }
+
+    // SECURITY: Validate consultation exists and user has access
+    const consultation = await prisma.consultation.findUnique({
+      where: { id: consultationId },
+      include: {
+        patient: {
+          select: {
+            id: true,
+            clinicId: true,
+          },
+        },
+        doctor: {
+          select: {
+            id: true,
+            clinicId: true,
+          },
+        },
+      },
+    })
+
+    if (!consultation) {
+      return apiError('Consultation not found', 404, context.requestId)
+    }
+
+    // SECURITY: Enforce tenant isolation
+    enforceTenant(consultation.clinicId, session.clinicId, context)
+
+    // SECURITY: Verify user has access to this consultation
+    if (session.role === 'patient') {
+      const patient = await prisma.patient.findUnique({
+        where: {
+          userId: session.id,
+          clinicId: session.clinicId,
+        },
+        select: { id: true },
+      })
+
+      if (!patient || patient.id !== consultation.patientId) {
+        return apiError('Unauthorized: You do not have access to this consultation', 403, context.requestId)
+      }
+    } else if (session.role === 'doctor') {
+      const doctor = await prisma.doctor.findUnique({
+        where: {
+          userId: session.id,
+          clinicId: session.clinicId,
+        },
+        select: { id: true },
+      })
+
+      if (!doctor || doctor.id !== consultation.doctorId) {
+        return apiError('Unauthorized: You do not have access to this consultation', 403, context.requestId)
+      }
     }
     
-    // Log consultation view
-    const { logConsultationView, getRequestFromNextRequest } = await import('@/lib/security/event-logging')
-    await logConsultationView(
-      user.id,
+    // Audit log: Transcript access (PHI-safe - only logs metadata)
+    logTranscriptAccess(
+      session.id,
+      session.clinicId,
       consultationId,
-      user.role,
-      getRequestFromNextRequest(request),
+      context.ip,
+      request,
       requestId
-    )
+    ).catch((err) => {
+      // Audit logging should never break the request - fail silently
+      console.error('Audit logging failed (non-critical):', err)
+    })
 
     // Get transcription from Firestore using utility function
     const { getTranscription } = await import('@/lib/stt/streaming')
@@ -214,23 +336,25 @@ export async function GET(request: NextRequest) {
   }
 }
 
-// TODO: DELETE endpoint - End streaming session
+// DELETE endpoint - End streaming session
 export async function DELETE(request: NextRequest) {
-  const requestId = uuidv4()
+  const context = getGuardContext(request)
+  const requestId = context.requestId
   
   try {
-    // Require authentication first (needed for user ID)
-    const user = await requireAuth(request)
+    // SECURITY: Require valid session and role
+    const session = await requireSession(request)
+    requireRole(session, ['doctor', 'patient'], context)
     
     // Rate limiting: 10 STT chunks per second
-    const rateLimitResponse = await firestoreRateLimiters.sttChunks(request, user.id)
+    const rateLimitResponse = await firestoreRateLimiters.sttChunks(request, session.id)
     if (rateLimitResponse) {
       return addSecurityHeaders(rateLimitResponse)
     }
 
     const sessionId = request.headers.get('X-Session-Id')
     if (!sessionId) {
-      return apiError('Session ID required', 400)
+      return apiError('Session ID required', 400, context.requestId)
     }
 
     // Close any active streams (in a real implementation, you'd track these)

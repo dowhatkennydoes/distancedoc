@@ -1,21 +1,40 @@
-// TODO: Get current user session
-// TODO: Return user information and role
-// TODO: Check authentication status
+/**
+ * Session Route with Proper Cookie Handling
+ * 
+ * Returns current user session using createRouteHandlerClient
+ * Properly reads session from httpOnly cookies
+ */
 
 import { NextRequest, NextResponse } from 'next/server'
+import { createRouteHandlerClient } from '@/lib/auth/supabase'
 import { getAuthUser, apiError, apiSuccess } from '@/lib/auth/api-protection'
+import { addSecurityHeaders } from '@/lib/security/headers'
 
 export async function GET(request: NextRequest) {
   try {
+    // Use createRouteHandlerClient to properly read cookies
+    const { supabase } = createRouteHandlerClient(request)
+    
+    // Verify session exists
+    const {
+      data: { session },
+      error: sessionError,
+    } = await supabase.auth.getSession()
+
+    if (sessionError || !session) {
+      return addSecurityHeaders(apiError('Not authenticated', 401))
+    }
+
+    // Get authenticated user with role metadata
     const user = await getAuthUser(request)
 
     if (!user) {
-      return apiError('Not authenticated', 401)
+      return addSecurityHeaders(apiError('Not authenticated', 401))
     }
 
-    return apiSuccess({ user })
+    return addSecurityHeaders(apiSuccess({ user }))
   } catch (error: any) {
-    return apiError(error.message || 'Internal server error', 500)
+    return addSecurityHeaders(apiError(error.message || 'Internal server error', 500))
   }
 }
 

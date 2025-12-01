@@ -4,11 +4,16 @@
 // TODO: Download files
 
 import { NextRequest } from 'next/server'
+import { Storage } from '@google-cloud/storage'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
-import { requireSession, requireRole, requireOwnership, getGuardContext } from '@/lib/auth/guards'
+import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
+import { ensureOwnershipOrDoctor } from '@/lib/auth/patient-access'
 import { withClinicScope } from '@/lib/auth/tenant-scope'
+import { validate } from '@/lib/validation'
+import { fileUploadSchema } from '@/lib/validation/schemas'
+import { logFileListAccess } from '@/lib/logging/audit'
 import { prisma } from '@/db/prisma'
-import { uploadFile } from '@/lib/gcp/gcp-storage'
+import { fileRecordSelect } from '@/lib/db/selects'
 
 // GET - Get patient files
 export async function GET(request: NextRequest) {
@@ -18,34 +23,72 @@ export async function GET(request: NextRequest) {
     // Require valid session
     const session = await requireSession(request)
     
-    // Require patient role
-    requireRole(session, 'patient', context)
+    // Allow patient or doctor role
+    requireRole(session, ['patient', 'doctor'], context)
 
-    // Get patient record with clinic scoping
-    const patient = await prisma.patient.findUnique({
-      where: { 
-        userId: session.id,
-        clinicId: session.clinicId, // Tenant isolation
-      },
-      select: { id: true, clinicId: true },
-    })
+    // Get patientId from query params if doctor, otherwise from session
+    const patientIdParam = request.nextUrl.searchParams.get('patientId')
+    let patientId: string
 
-    if (!patient) {
-      return apiError('Patient profile not found', 404, context.requestId)
+    if (session.role === 'doctor' && patientIdParam) {
+      // Doctor accessing specific patient's files
+      await ensureOwnershipOrDoctor(session, patientIdParam, context)
+      patientId = patientIdParam
+    } else if (session.role === 'patient') {
+      // Patient accessing their own files
+      const patient = await prisma.patient.findUnique({
+        where: { 
+          userId: session.id,
+          clinicId: session.clinicId,
+        },
+        select: { id: true },
+      })
+
+      if (!patient) {
+        return apiError('Patient profile not found', 404, context.requestId)
+      }
+
+      await ensureOwnershipOrDoctor(session, patient.id, context)
+      patientId = patient.id
+    } else {
+      return apiError('Invalid access', 403, context.requestId)
     }
-
-    // Verify ownership - patient can only access their own files
-    await requireOwnership(session.id, patient.id, session.role, context)
 
     const category = request.nextUrl.searchParams.get('category')
 
-    // Get files with clinic scoping
+    // Get files with clinic scoping using safe select
     const files = await prisma.fileRecord.findMany({
       where: withClinicScope(session.clinicId, {
-        patientId: patient.id,
+        patientId,
         ...(category && { category }),
       }),
+      select: {
+        id: true,
+        fileName: true,
+        fileType: true,
+        fileSize: true,
+        storageUrl: true,
+        category: true,
+        description: true,
+        encrypted: true,
+        createdAt: true,
+        updatedAt: true,
+      },
       orderBy: { createdAt: 'desc' },
+    })
+
+    // Audit log: Patient files list access (PHI-safe - only logs metadata)
+    logFileListAccess(
+      session.id,
+      session.clinicId,
+      patientId,
+      files.length,
+      context.ip,
+      request,
+      context.requestId
+    ).catch((err) => {
+      // Audit logging should never break the request - fail silently
+      console.error('Audit logging failed (non-critical):', err)
     })
 
     return apiSuccess(files, 200, context.requestId)
@@ -68,32 +111,62 @@ export async function POST(request: NextRequest) {
     // Require valid session
     const session = await requireSession(request)
     
-    // Require patient role
-    requireRole(session, 'patient', context)
+    // Allow patient or doctor role (doctors may upload files for patients)
+    requireRole(session, ['patient', 'doctor'], context)
 
-    // Get patient record with clinic scoping
-    const patient = await prisma.patient.findUnique({
-      where: { 
-        userId: session.id,
-        clinicId: session.clinicId, // Tenant isolation
-      },
-      select: { id: true, clinicId: true },
-    })
-
-    if (!patient) {
-      return apiError('Patient profile not found', 404, context.requestId)
-    }
-
-    // Verify ownership
-    await requireOwnership(session.id, patient.id, session.role, context)
-
+    // Get form data and validate
     const formData = await request.formData()
     const file = formData.get('file') as File
-    const category = formData.get('category') as string
-    const description = formData.get('description') as string
 
     if (!file) {
-      return apiError('File is required', 400)
+      return apiError('File is required', 400, context.requestId)
+    }
+
+    // Build validation payload from form data
+    const uploadPayload = {
+      patientId: formData.get('patientId') as string,
+      fileName: file.name,
+      fileType: file.type,
+      fileSize: file.size,
+      category: formData.get('category') as string | undefined,
+      description: formData.get('description') as string | undefined,
+      consultationId: formData.get('consultationId') as string | undefined,
+      appointmentId: formData.get('appointmentId') as string | undefined,
+    }
+
+    // Validate upload data
+    const validatedData = validate(fileUploadSchema, uploadPayload, context.requestId)
+
+    // Determine patient ID and verify access
+    let patientId: string
+
+    if (session.role === 'doctor' && validatedData.patientId) {
+      // Doctor uploading file for a specific patient
+      await ensureOwnershipOrDoctor(session, validatedData.patientId, context)
+      patientId = validatedData.patientId
+    } else if (session.role === 'patient') {
+      // Patient uploading their own file
+      const patient = await prisma.patient.findUnique({
+        where: { 
+          userId: session.id,
+          clinicId: session.clinicId,
+        },
+        select: { id: true },
+      })
+
+      if (!patient) {
+        return apiError('Patient profile not found', 404, context.requestId)
+      }
+
+      await ensureOwnershipOrDoctor(session, patient.id, context)
+      patientId = patient.id
+      
+      // Ensure patientId matches if provided
+      if (validatedData.patientId && validatedData.patientId !== patient.id) {
+        return apiError('You can only upload files for yourself', 403, context.requestId)
+      }
+    } else {
+      return apiError('Invalid access', 403, context.requestId)
     }
 
     // Upload to Cloud Storage
@@ -115,14 +188,14 @@ export async function POST(request: NextRequest) {
         })
 
     const bucket = storage.bucket(process.env.GCP_STORAGE_BUCKET || 'distancedoc-uploads')
-    const fileName = `patients/${patient.id}/${Date.now()}-${file.name}`
+    const fileName = `patients/${patientId}/${Date.now()}-${validatedData.fileName}`
     const fileRef = bucket.file(fileName)
 
     await fileRef.save(buffer, {
-      contentType: file.type,
+      contentType: validatedData.fileType,
       metadata: {
         uploadedBy: session.id,
-        patientId: patient.id,
+        patientId,
       },
     })
 
@@ -132,19 +205,19 @@ export async function POST(request: NextRequest) {
       expires: Date.now() + 365 * 24 * 60 * 60 * 1000, // 1 year
     })
 
-    // Create file record with clinic scoping
+    // Create file record with clinic scoping and required fields
     const fileRecord = await prisma.fileRecord.create({
       data: {
-        patientId: patient.id,
-        fileName: file.name,
-        fileType: file.type,
-        fileSize: file.size,
+        patientId,
+        clinicId: session.clinicId,
+        createdByUserId: session.id, // Required field for audit trail
+        fileName: validatedData.fileName,
+        fileType: validatedData.fileType,
+        fileSize: validatedData.fileSize,
         storageUrl: url,
         storagePath: fileName,
-        category: category || 'General',
-        description: description || null,
-        uploadedBy: session.id,
-        // Note: FileRecord doesn't have clinicId directly, but it's scoped through patient
+        category: validatedData.category || 'General',
+        description: validatedData.description || null,
       },
     })
 

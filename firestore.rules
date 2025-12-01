@@ -1,0 +1,331 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to get user role from custom claims or user document
+    function getUserRole() {
+      return request.auth != null && request.auth.token.role != null 
+        ? request.auth.token.role 
+        : null;
+    }
+    
+    // Helper function to get user ID
+    function getUserId() {
+      return request.auth != null ? request.auth.uid : null;
+    }
+    
+    // Helper function to check if user is support role
+    function isSupport() {
+      return getUserRole() == 'support';
+    }
+    
+    // Helper function to check if user is doctor
+    function isDoctor() {
+      return getUserRole() == 'doctor';
+    }
+    
+    // Helper function to check if user is patient
+    function isPatient() {
+      return getUserRole() == 'patient';
+    }
+    
+    // Helper function to check if user is admin
+    function isAdmin() {
+      return getUserRole() == 'admin';
+    }
+    
+    // Helper function to check if user is participant in thread
+    function isThreadParticipant(threadData) {
+      let userId = getUserId();
+      if (userId == null) return false;
+      
+      // Check if user is doctor or patient in thread
+      // Note: participants array check would require iteration, 
+      // so we rely on doctorId/patientId for now
+      return (threadData.doctorId == userId || 
+              threadData.patientId == userId);
+    }
+    
+    // Helper function to get doctor ID from user ID (if needed)
+    function getDoctorId(userId) {
+      // This assumes doctor documents have userId field
+      // Adjust based on your actual data structure
+      return userId;
+    }
+    
+    // Helper function to get patient ID from user ID (if needed)
+    function getPatientId(userId) {
+      // This assumes patient documents have userId field
+      // Adjust based on your actual data structure
+      return userId;
+    }
+    
+    // ============================================
+    // MESSAGE THREADS COLLECTION
+    // ============================================
+    
+    match /message_threads/{threadId} {
+      // Helper to check if current user is participant
+      function isParticipant() {
+        let userId = getUserId();
+        if (userId == null) return false;
+        
+        // Check resource data for participants
+        return (resource.data.doctorId == userId || 
+                resource.data.patientId == userId);
+      }
+      
+      // Helper to check if current user is participant in request data
+      function isParticipantInRequest() {
+        let userId = getUserId();
+        if (userId == null) return false;
+        
+        // Check request data for participants
+        return (request.resource.data.doctorId == userId || 
+                request.resource.data.patientId == userId);
+      }
+      
+      // READ: Only participants can read threads
+      // Doctors cannot read other doctors' threads
+      // Patients can only read their own threads
+      // Support role → read-only
+      allow read: if request.auth != null && (
+        // Support role can read all (read-only)
+        isSupport() ||
+        // Admin can read all
+        isAdmin() ||
+        // User is participant in thread
+        (isParticipant() && (
+          // If patient, can always read their own threads
+          (isPatient() && resource.data.patientId == getUserId()) ||
+          // If doctor, can read if they are the doctor in thread
+          // AND not trying to read another doctor's thread
+          (isDoctor() && resource.data.doctorId == getUserId())
+        ))
+      );
+      
+      // CREATE: Only participants can create threads
+      // Must include themselves as participant
+      allow create: if request.auth != null && (
+        // Admin can create
+        isAdmin() ||
+        // User must be either doctorId or patientId in the thread
+        (isParticipantInRequest() && (
+          // Doctor creating thread with themselves
+          (isDoctor() && request.resource.data.doctorId == getUserId()) ||
+          // Patient creating thread with themselves
+          (isPatient() && request.resource.data.patientId == getUserId())
+        ))
+      );
+      
+      // UPDATE: Only participants can update threads
+      // Support role → read-only (no updates)
+      allow update: if request.auth != null && (
+        // Admin can update
+        isAdmin() ||
+        // Support cannot update (read-only)
+        !isSupport() &&
+        // User is participant
+        (isParticipant() && (
+          // Doctor can update their own threads
+          (isDoctor() && resource.data.doctorId == getUserId()) ||
+          // Patient can update their own threads
+          (isPatient() && resource.data.patientId == getUserId())
+        )) &&
+        // Prevent changing participants (security)
+        request.resource.data.doctorId == resource.data.doctorId &&
+        request.resource.data.patientId == resource.data.patientId
+      );
+      
+      // DELETE: Only participants can delete threads
+      // Support role → read-only (no deletes)
+      allow delete: if request.auth != null && (
+        // Admin can delete
+        isAdmin() ||
+        // Support cannot delete (read-only)
+        !isSupport() &&
+        // User is participant
+        (isParticipant() && (
+          // Doctor can delete their own threads
+          (isDoctor() && resource.data.doctorId == getUserId()) ||
+          // Patient can delete their own threads
+          (isPatient() && resource.data.patientId == getUserId())
+        ))
+      );
+    }
+    
+    // ============================================
+    // MESSAGES COLLECTION
+    // ============================================
+    
+    match /messages/{messageId} {
+      // Helper to get thread data
+      function getThread() {
+        return get(/databases/$(database)/documents/message_threads/$(resource.data.threadId));
+      }
+      
+      // Helper to check if user is participant in message's thread
+      function isMessageThreadParticipant() {
+        let thread = getThread();
+        let userId = getUserId();
+        if (userId == null) return false;
+        
+        return (thread.data.doctorId == userId || 
+                thread.data.patientId == userId);
+      }
+      
+      // Helper to check if user is participant in request thread
+      function isRequestThreadParticipant() {
+        let threadId = request.resource.data.threadId;
+        let thread = get(/databases/$(database)/documents/message_threads/$(threadId));
+        let userId = getUserId();
+        if (userId == null) return false;
+        
+        return (thread.data.doctorId == userId || 
+                thread.data.patientId == userId);
+      }
+      
+      // READ: Only participants of thread can read messages
+      // Patients can only read their own messages (in their threads)
+      // Support role → read-only
+      allow read: if request.auth != null && (
+        // Support role can read all (read-only)
+        isSupport() ||
+        // Admin can read all
+        isAdmin() ||
+        // User is participant in message's thread
+        (isMessageThreadParticipant() && (
+          // If patient, can only read messages in their own threads
+          (isPatient() && getThread().data.patientId == getUserId()) ||
+          // If doctor, can read messages in their threads
+          (isDoctor() && getThread().data.doctorId == getUserId())
+        ))
+      );
+      
+      // CREATE: Only participants can create messages
+      // Must be sender and participant in thread
+      allow create: if request.auth != null && (
+        // Admin can create
+        isAdmin() ||
+        // Support cannot create (read-only)
+        !isSupport() &&
+        // User must be sender
+        request.resource.data.senderId == getUserId() &&
+        // User must be participant in thread
+        isRequestThreadParticipant() &&
+        // Validate sender role matches user role
+        request.resource.data.senderRole == getUserRole()
+      );
+      
+      // UPDATE: Only sender can update their own messages
+      // Support role → read-only (no updates)
+      allow update: if request.auth != null && (
+        // Admin can update
+        isAdmin() ||
+        // Support cannot update (read-only)
+        !isSupport() &&
+        // User is the sender
+        resource.data.senderId == getUserId() &&
+        // Can only update certain fields (e.g., read status)
+        // Prevent changing senderId, threadId, senderRole
+        request.resource.data.senderId == resource.data.senderId &&
+        request.resource.data.threadId == resource.data.threadId &&
+        request.resource.data.senderRole == resource.data.senderRole
+      );
+      
+      // DELETE: Only sender can delete their own messages
+      // Support role → read-only (no deletes)
+      allow delete: if request.auth != null && (
+        // Admin can delete
+        isAdmin() ||
+        // Support cannot delete (read-only)
+        !isSupport() &&
+        // User is the sender
+        resource.data.senderId == getUserId()
+      );
+    }
+    
+    // ============================================
+    // USERS COLLECTION (if storing user data in Firestore)
+    // ============================================
+    
+    match /users/{userId} {
+      // Users can only read their own data
+      // Support can read all (read-only)
+      allow read: if request.auth != null && (
+        isSupport() ||
+        isAdmin() ||
+        userId == getUserId()
+      );
+      
+      // Users can only update their own data
+      // Support cannot update (read-only)
+      allow update: if request.auth != null && (
+        isAdmin() ||
+        (!isSupport() && userId == getUserId())
+      );
+      
+      // Only admins can create/delete users
+      allow create, delete: if request.auth != null && isAdmin();
+    }
+    
+    // ============================================
+    // CONSULTATIONS COLLECTION (if using Firestore)
+    // ============================================
+    
+    match /consultations/{consultationId} {
+      // Only participants can access
+      allow read: if request.auth != null && (
+        isSupport() ||
+        isAdmin() ||
+        resource.data.doctorId == getUserId() ||
+        resource.data.patientId == getUserId()
+      );
+      
+      // Only participants can create/update
+      allow create, update: if request.auth != null && (
+        isAdmin() ||
+        (!isSupport() && (
+          request.resource.data.doctorId == getUserId() ||
+          request.resource.data.patientId == getUserId()
+        ))
+      );
+      
+      // Only admins can delete
+      allow delete: if request.auth != null && isAdmin();
+    }
+    
+    // ============================================
+    // RATE LIMITS COLLECTION (for rate limiting)
+    // ============================================
+    
+    match /rate_limits/{rateLimitId} {
+      // Only server/service can access
+      allow read, write: if false; // Block all client access
+    }
+    
+    // ============================================
+    // AUDIT LOGS COLLECTION (for PHI-safe logging)
+    // ============================================
+    
+    match /audit_logs/{logId} {
+      // Only admins can read audit logs
+      allow read: if request.auth != null && isAdmin();
+      
+      // Only server/service can write
+      allow write: if false; // Block all client access
+    }
+    
+    // ============================================
+    // DEFAULT DENY ALL - Block wildcard write access
+    // ============================================
+    
+    // Explicitly deny all other collections
+    match /{document=**} {
+      // Deny all access by default
+      allow read, write: if false;
+    }
+  }
+}
+

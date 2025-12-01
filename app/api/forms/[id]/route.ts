@@ -5,9 +5,12 @@
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
 import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
-import { verifyClinicAccess } from '@/lib/auth/tenant-scope'
+import { ensureOwnershipOrDoctor } from '@/lib/auth/patient-access'
+import { enforceTenant } from '@/lib/auth/tenant'
 import { prisma } from '@/db/prisma'
+import { intakeFormResponseSelect } from '@/lib/db/selects'
 import { z } from 'zod'
+import { getCachedIntakeTemplate, setCachedIntakeTemplate, invalidateIntakeTemplate } from '@/lib/cache/intake-templates'
 
 // TODO: Update form schema
 const UpdateFormSchema = z.object({
@@ -32,27 +35,40 @@ export async function GET(
     // Allow patient or doctor to view forms
     requireRole(session, ['patient', 'doctor'], context)
 
-    const form = await prisma.intakeForm.findUnique({
-      where: { id: params.id },
-      include: {
-        patient: {
-          select: { clinicId: true },
-        },
-      },
-    })
+    // Try to get from cache first
+    let form = await getCachedIntakeTemplate(params.id)
 
     if (!form) {
-      return apiError('Form not found', 404, context.requestId)
+      // Cache miss - fetch from database
+      form = await prisma.intakeForm.findUnique({
+        where: { id: params.id },
+        select: {
+          ...intakeFormResponseSelect,
+          patient: {
+            select: {
+              clinicId: true,
+              id: true,
+              firstName: true,
+              lastName: true,
+              dateOfBirth: true,
+            },
+          },
+        },
+      })
+
+      if (!form) {
+        return apiError('Form not found', 404, context.requestId)
+      }
+
+      // Cache the form template (1 hour TTL)
+      await setCachedIntakeTemplate(params.id, form, 3600)
     }
 
-    // Verify clinic access
-    verifyClinicAccess(
-      form.patient.clinicId,
-      session.clinicId,
-      'intakeForm',
-      params.id,
-      context.requestId
-    )
+    // SECURITY: Enforce tenant isolation - verify clinicId matches
+    enforceTenant(form.clinicId, session.clinicId, context)
+
+    // Verify user has access to this patient's form
+    await ensureOwnershipOrDoctor(session, form.patientId, context)
 
     return apiSuccess(form, 200, context.requestId)
   } catch (error: any) {
@@ -78,7 +94,7 @@ export async function PUT(
     const session = await requireSession(request)
     
     // Require doctor role and approval
-    requireRole(session, 'doctor', context)
+    requireRole(session, ['doctor'], context)
     
     if (!session.metadata.approved) {
       return apiError('Doctor account pending approval', 403, context.requestId)
@@ -87,14 +103,30 @@ export async function PUT(
     const body = await request.json()
     const validatedData = UpdateFormSchema.parse(body)
 
-    // Verify form ownership
+    // Verify form exists and belongs to user's clinic
     const existingForm = await prisma.intakeForm.findUnique({
       where: { id: params.id },
+      include: {
+        patient: {
+          select: {
+            id: true,
+            clinicId: true,
+          },
+        },
+      },
     })
 
     if (!existingForm) {
       return apiError('Form not found', 404, context.requestId)
     }
+
+    // SECURITY: Enforce tenant isolation - verify clinicId matches
+    if (existingForm.clinicId !== session.clinicId) {
+      return apiError('Forbidden: Form belongs to different clinic', 403, context.requestId)
+    }
+
+    // Verify doctor has access to this patient's form
+    await ensureOwnershipOrDoctor(session, existingForm.patientId, context)
 
     // Update form
     const updatedForm = await prisma.intakeForm.update({
@@ -113,7 +145,11 @@ export async function PUT(
             }
           : {}),
       },
+      select: intakeFormResponseSelect,
     })
+
+    // Invalidate cache after update
+    await invalidateIntakeTemplate(params.id)
 
     return apiSuccess(updatedForm, 200, context.requestId)
   } catch (error: any) {
@@ -143,15 +179,43 @@ export async function DELETE(
     const session = await requireSession(request)
     
     // Require doctor role and approval
-    requireRole(session, 'doctor', context)
+    requireRole(session, ['doctor'], context)
     
     if (!session.metadata.approved) {
       return apiError('Doctor account pending approval', 403, context.requestId)
     }
 
+    // SECURITY: Verify form exists and belongs to user's clinic before deletion
+    const existingForm = await prisma.intakeForm.findUnique({
+      where: { id: params.id },
+      include: {
+        patient: {
+          select: {
+            id: true,
+            clinicId: true,
+          },
+        },
+      },
+    })
+
+    if (!existingForm) {
+      return apiError('Form not found', 404, context.requestId)
+    }
+
+    // SECURITY: Enforce tenant isolation - verify clinicId matches
+    if (existingForm.clinicId !== session.clinicId) {
+      return apiError('Forbidden: Form belongs to different clinic', 403, context.requestId)
+    }
+
+    // Verify doctor has access to this patient's form
+    await ensureOwnershipOrDoctor(session, existingForm.patientId, context)
+
     await prisma.intakeForm.delete({
       where: { id: params.id },
     })
+
+    // Invalidate cache after deletion
+    await invalidateIntakeTemplate(params.id)
 
     return apiSuccess({ success: true }, 200, context.requestId)
   } catch (error: any) {

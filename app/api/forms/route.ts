@@ -6,8 +6,10 @@
 import { NextRequest } from 'next/server'
 import { apiError, apiSuccess } from '@/lib/auth/api-protection'
 import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
+import { requireDoctorAccessToPatient, ensurePatientBelongsToDoctorClinic } from '@/lib/auth/patient-access'
 import { withClinicScope } from '@/lib/auth/tenant-scope'
 import { prisma } from '@/db/prisma'
+import { intakeFormResponseSelect } from '@/lib/db/selects'
 import { z } from 'zod'
 import type { FormQuestion } from '@/lib/forms/types'
 
@@ -75,42 +77,26 @@ export async function GET(request: NextRequest) {
     let where: any = {}
 
     if (patientId) {
-      // Verify patient belongs to same clinic
-      const patient = await prisma.patient.findUnique({
-        where: { 
-          id: patientId,
-          clinicId: session.clinicId, // Tenant isolation
-        },
-        select: { id: true },
-      })
-
-      if (!patient) {
-        return apiError('Patient not found', 404, context.requestId)
-      }
+      // Verify doctor has access to this patient (clinic + relationship check)
+      await requireDoctorAccessToPatient(session, patientId, context)
 
       // Get forms assigned to this patient (with clinic scoping)
       where.patientId = patientId
     } else {
-      // Get forms created by this doctor (templates) - filter by clinic through patient
+      // OPTIMIZED: Query forms directly with clinicId filter (eliminates N+1 pattern)
+      // Get forms created by this doctor (templates) - filter by clinicId directly
       // Note: Forms are templates. For now, we'll store doctorId in formData
-      // We need to get all patients in this clinic, then their forms
-      const clinicPatients = await prisma.patient.findMany({
-        where: { clinicId: session.clinicId },
-        select: { id: true },
-      })
-
-      const patientIds = clinicPatients.map((p) => p.id)
-
       const allForms = await prisma.intakeForm.findMany({
-        where: {
-          patientId: { in: patientIds },
+        where: withClinicScope(session.clinicId, {
           ...(type && { type: type as any }),
           ...(status && { status: status as any }),
-        },
+        }),
+        select: intakeFormResponseSelect,
         orderBy: { createdAt: 'desc' },
       })
 
       // Filter forms by doctor (stored in formData.doctorId)
+      // TODO: Consider adding doctorId field to IntakeForm model to eliminate this filter
       const forms = allForms.filter((form) => {
         const formData = form.formData as any
         return formData?.doctorId === doctor.id
@@ -122,9 +108,10 @@ export async function GET(request: NextRequest) {
     if (type) where.type = type
     if (status) where.status = status
 
-    // Get forms with clinic scoping (through patient)
+    // OPTIMIZED: Get forms with clinic scoping using safe select
     const forms = await prisma.intakeForm.findMany({
-      where,
+      where: withClinicScope(session.clinicId, where),
+      select: intakeFormResponseSelect,
       orderBy: { createdAt: 'desc' },
     })
 
@@ -160,8 +147,11 @@ export async function POST(request: NextRequest) {
 
     // Get doctor record
     const doctor = await prisma.doctor.findUnique({
-      where: { userId: session.id },
-      select: { id: true },
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId,
+      },
+      select: { id: true, clinicId: true },
     })
 
     if (!doctor) {
@@ -174,18 +164,34 @@ export async function POST(request: NextRequest) {
     
     // Get or create a placeholder patient for form templates
     // This is a workaround - ideally forms should be templates not tied to patients
-    const placeholderPatient = await prisma.patient.findFirst({
-      where: { userId: user.id }, // Temporary: use doctor's user ID to find/create placeholder
+    let placeholderPatient = await prisma.patient.findFirst({
+      where: { 
+        userId: session.id,
+        clinicId: session.clinicId,
+      },
+      select: { id: true },
     })
 
     if (!placeholderPatient) {
-      return apiError('Patient record required for form creation', 400)
+      // Create a minimal placeholder patient for template association
+      placeholderPatient = await prisma.patient.create({
+        data: {
+          userId: session.id,
+          clinicId: doctor.clinicId,
+          firstName: 'Template',
+          lastName: 'Patient',
+          dateOfBirth: new Date(),
+          sex: 'Unknown',
+        },
+        select: { id: true },
+      })
     }
 
     // Create form with questions in formData JSON
     const form = await prisma.intakeForm.create({
       data: {
         patientId: placeholderPatient.id,
+        clinicId: doctor.clinicId,
         type: validatedData.type,
         status: 'DRAFT',
         formData: {
@@ -196,6 +202,7 @@ export async function POST(request: NextRequest) {
           isTemplate: true, // Mark as template
         },
       },
+      select: intakeFormResponseSelect,
     })
 
     return apiSuccess(form, 201, context.requestId)

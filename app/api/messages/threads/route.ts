@@ -20,87 +20,86 @@ export async function GET(request: NextRequest) {
     // Require patient or doctor role
     requireRole(session, ['patient', 'doctor'], context)
 
-    // Get patient or doctor record with clinic scoping
-    const patient = await prisma.patient.findUnique({
-      where: { 
-        userId: session.id,
-        clinicId: session.clinicId, // Tenant isolation
-      },
-      select: { id: true, clinicId: true },
-    })
-
-    const doctor = await prisma.doctor.findUnique({
-      where: { 
-        userId: session.id,
-        clinicId: session.clinicId, // Tenant isolation
-      },
-      select: { id: true, clinicId: true },
-    })
+    // OPTIMIZED: Get patient or doctor record - batch both queries in parallel
+    const [patient, doctor] = await Promise.all([
+      prisma.patient.findUnique({
+        where: { 
+          userId: session.id,
+          clinicId: session.clinicId, // Tenant isolation
+        },
+        select: { id: true, clinicId: true },
+      }),
+      prisma.doctor.findUnique({
+        where: { 
+          userId: session.id,
+          clinicId: session.clinicId, // Tenant isolation
+        },
+        select: { id: true, clinicId: true },
+      }),
+    ])
 
     if (!patient && !doctor) {
       return apiError('User profile not found', 404, context.requestId)
     }
 
+    // OPTIMIZED: Single query with optimized SELECT to reduce over-fetching
     let threads
     if (patient) {
-      // Get threads where patient is involved (with clinic scoping)
       threads = await prisma.messageThread.findMany({
         where: withClinicScope(session.clinicId, { patientId: patient.id }),
-        include: {
+        select: {
+          id: true,
+          subject: true,
+          lastMessageAt: true,
+          unreadByPatient: true,
           doctor: {
-            include: {
-              user: {
-                select: {
-                  firstName: true,
-                  lastName: true,
-                  email: true,
-                },
-              },
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              specialization: true,
             },
           },
           messages: {
             orderBy: { createdAt: 'desc' },
             take: 1,
-            include: {
-              sender: {
-                select: {
-                  firstName: true,
-                  lastName: true,
-                  email: true,
-                },
-              },
+            select: {
+              id: true,
+              content: true,
+              senderId: true,
+              senderRole: true,
+              read: true,
+              createdAt: true,
             },
           },
         },
         orderBy: { lastMessageAt: 'desc' },
       })
     } else if (doctor) {
-      // Get threads where doctor is involved (with clinic scoping)
       threads = await prisma.messageThread.findMany({
         where: withClinicScope(session.clinicId, { doctorId: doctor.id }),
-        include: {
+        select: {
+          id: true,
+          subject: true,
+          lastMessageAt: true,
+          unreadByDoctor: true,
           patient: {
-            include: {
-              user: {
-                select: {
-                  firstName: true,
-                  lastName: true,
-                  email: true,
-                },
-              },
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
             },
           },
           messages: {
             orderBy: { createdAt: 'desc' },
             take: 1,
-            include: {
-              sender: {
-                select: {
-                  firstName: true,
-                  lastName: true,
-                  email: true,
-                },
-              },
+            select: {
+              id: true,
+              content: true,
+              senderId: true,
+              senderRole: true,
+              read: true,
+              createdAt: true,
             },
           },
         },
@@ -108,28 +107,28 @@ export async function GET(request: NextRequest) {
       })
     }
 
-    // Format response
+    // Format response (optimized - no N+1 queries)
     const formatted = threads?.map((thread) => {
       const lastMessage = thread.messages[0]
       const otherParty = patient
         ? {
-            name: `${thread.doctor.user.firstName || ''} ${thread.doctor.user.lastName || ''}`.trim() || thread.doctor.user.email,
-            specialization: thread.doctor.specialization,
+            name: `${thread.doctor.firstName || ''} ${thread.doctor.lastName || ''}`.trim(),
+            specialization: thread.doctor.specialization || null,
           }
         : {
-            name: `${thread.patient.user.firstName || ''} ${thread.patient.user.lastName || ''}`.trim() || thread.patient.user.email,
+            name: `${thread.patient.firstName || ''} ${thread.patient.lastName || ''}`.trim(),
           }
 
-      const unreadCount = patient
-        ? thread.unreadByPatient
-          ? thread.messages.filter((m) => !m.read && m.senderId !== session.id).length
-          : 0
-        : thread.unreadByDoctor
-        ? thread.messages.filter((m) => !m.read && m.senderId !== session.id).length
-        : 0
+      // Unread count is boolean flag - calculate from last message if needed
+      const unreadCount = (patient ? thread.unreadByPatient : thread.unreadByDoctor) 
+        && lastMessage 
+        && !lastMessage.read 
+        && lastMessage.senderId !== session.id
+        ? 1 : 0
 
       return {
         id: thread.id,
+        subject: thread.subject,
         otherParty,
         lastMessage: lastMessage
           ? {

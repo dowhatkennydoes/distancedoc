@@ -1,261 +1,346 @@
-// TODO: Generate signed upload URL endpoint
-// TODO: Create signed URL for direct Cloud Storage upload
-// TODO: Support image and PDF uploads
-// TODO: Save metadata in FileRecord table
-// TODO: Associate with consultations or patient charts
-// TODO: Validate file types and sizes
+/**
+ * File Upload URL API Route - With Strict Ownership and Clinic Enforcement
+ * 
+ * Generates signed URLs for direct Cloud Storage uploads with:
+ * - Ownership validation (doctor or patient themselves)
+ * - Clinic ID enforcement
+ * - Complete audit trail
+ */
 
 import { NextRequest } from 'next/server'
-import { requireAuth, apiError } from '@/lib/auth/api-protection'
+import { apiError, apiSuccess } from '@/lib/auth/api-protection'
+import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
+import { ensureOwnershipOrDoctor, requireDoctorAccessToPatient } from '@/lib/auth/patient-access'
+import { enforceTenant } from '@/lib/auth/tenant'
+import { validate } from '@/lib/validation'
+import { fileUploadSchema } from '@/lib/validation/schemas'
 import { prisma } from '@/db/prisma'
 import { generateSignedUploadUrl, getStorageClient, getBucket } from '@/lib/gcp/gcp-storage'
-import { z } from 'zod'
-import { firestoreRateLimiters } from '@/lib/security/firestore-rate-limit'
 import { sanitizeFileName, sanitizeString } from '@/lib/security/sanitize'
-import { addSecurityHeaders } from '@/lib/security/headers'
-import { logError, logAudit } from '@/lib/security/logging'
-import { handleApiError } from '@/lib/security/error-handler'
-import { v4 as uuidv4 } from 'uuid'
+import { logAudit } from '@/lib/security/logging'
+import { z } from 'zod'
 
-// TODO: Request validation schema
-const UploadUrlRequestSchema = z.object({
-  fileName: z.string().min(1, 'File name is required'),
-  fileType: z.string().refine(
-    (type) => {
-      const allowedTypes = [
-        'image/jpeg',
-        'image/jpg',
-        'image/png',
-        'image/gif',
-        'image/webp',
-        'application/pdf',
-        'application/msword',
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      ]
-      return allowedTypes.includes(type)
-    },
-    { message: 'File type not allowed. Only images and PDFs are supported.' }
-  ),
-  fileSize: z.number().int().positive().max(10 * 1024 * 1024, 'File size must be less than 10MB'),
-  category: z.string().optional(),
-  description: z.string().optional(),
-  consultationId: z.string().optional(),
-  appointmentId: z.string().optional(),
-})
-
-// TODO: POST - Generate signed upload URL
+/**
+ * POST - Generate signed upload URL
+ * 
+ * Requirements:
+ * - User must be a doctor or the patient themselves
+ * - Clinic ID must match
+ * - Patient ID must be validated
+ */
 export async function POST(request: NextRequest) {
-  const requestId = uuidv4()
+  const context = getGuardContext(request)
   
   try {
-    // Require authentication first (needed for user ID)
-    const user = await requireAuth(request)
-    
-    // Rate limiting: 10 uploads per minute
-    const rateLimitResponse = await firestoreRateLimiters.upload(request, user.id)
-    if (rateLimitResponse) {
-      return addSecurityHeaders(rateLimitResponse)
-    }
+    // 1. Require valid session
+    const session = await requireSession(request)
+    requireRole(session, ['doctor', 'patient'], context)
 
-    // Get patient or doctor record
-    const patient = await prisma.patient.findUnique({
-      where: { userId: user.id },
-    })
-
-    const doctor = await prisma.doctor.findUnique({
-      where: { userId: user.id },
-    })
-
-    if (!patient && !doctor) {
-      return apiError('User profile not found', 404)
-    }
-
-    // Parse and validate request body (limit size)
+    // 2. Validate request body
     const body = await request.json()
+    const validatedData = validate(fileUploadSchema, body, context.requestId)
     
-    // Limit request body size (10MB max)
-    if (JSON.stringify(body).length > 10 * 1024 * 1024) {
-      return addSecurityHeaders(apiError('Request body too large', 413))
-    }
-    
-    const validatedData = UploadUrlRequestSchema.parse(body)
-    
-    // Sanitize file name
-    validatedData.fileName = sanitizeFileName(validatedData.fileName)
-    if (validatedData.description) {
-      validatedData.description = sanitizeString(validatedData.description, 500)
+    // Sanitize inputs
+    const sanitizedFileName = sanitizeFileName(validatedData.fileName)
+    const sanitizedDescription = validatedData.description 
+      ? sanitizeString(validatedData.description, 1000)
+      : undefined
+
+    // 3. Determine and validate patient ID based on role
+    let targetPatientId: string
+    let targetClinicId: string
+
+    if (session.role === 'patient') {
+      // Patient uploading their own file - fetch their patient record
+      const patient = await prisma.patient.findUnique({
+        where: { 
+          userId: session.id,
+          clinicId: session.clinicId,
+        },
+        select: {
+          id: true,
+          clinicId: true,
+        },
+      })
+
+      if (!patient) {
+        return apiError('Patient profile not found', 404, context.requestId)
+      }
+
+      // Enforce: patient can only upload for themselves
+      // If patientId is provided, it must match their own ID
+      if (validatedData.patientId && validatedData.patientId !== patient.id) {
+        logAudit(
+          'FILE_UPLOAD_DENIED',
+          'patient',
+          session.id,
+          session.id,
+          false,
+          {
+            requestId: context.requestId,
+            reason: 'Patient attempted to upload file for different patient',
+            attemptedPatientId: validatedData.patientId,
+            ownPatientId: patient.id,
+          }
+        )
+        return apiError('You can only upload files for yourself', 403, context.requestId)
+      }
+
+      // Use patient's own ID (patientId not required in request for patients)
+      targetPatientId = patient.id
+      targetClinicId = patient.clinicId
+    } else if (session.role === 'doctor') {
+      // Doctor uploading file for a patient - patient ID is required
+      if (!validatedData.patientId) {
+        return apiError('Patient ID is required for doctor uploads', 400, context.requestId)
+      }
+
+      // Enforce: doctor must have access to this patient
+      await requireDoctorAccessToPatient(session, validatedData.patientId, context)
+
+      // Fetch patient to get clinic ID
+      const patient = await prisma.patient.findUnique({
+        where: { id: validatedData.patientId },
+        select: {
+          id: true,
+          clinicId: true,
+        },
+      })
+
+      if (!patient) {
+        return apiError('Patient not found', 404, context.requestId)
+      }
+
+      // Enforce: clinic ID must match
+      enforceTenant(patient.clinicId, session.clinicId, context)
+
+      targetPatientId = patient.id
+      targetClinicId = patient.clinicId
+    } else {
+      return apiError('Invalid role for file upload', 403, context.requestId)
     }
 
-    // Verify consultation/appointment access if provided
+    // 4. Verify consultation/appointment access if provided (optional additional validation)
     if (validatedData.consultationId) {
       const consultation = await prisma.consultation.findUnique({
         where: { id: validatedData.consultationId },
+        select: {
+          id: true,
+          patientId: true,
+          clinicId: true,
+        },
       })
 
       if (!consultation) {
-        return apiError('Consultation not found', 404)
+        return apiError('Consultation not found', 404, context.requestId)
       }
 
-      // Verify user has access to this consultation
-      if (patient && consultation.patientId !== patient.id) {
-        return apiError('Unauthorized', 403)
+      // Enforce: consultation must belong to the same patient and clinic
+      if (consultation.patientId !== targetPatientId) {
+        return apiError('Consultation does not belong to the specified patient', 400, context.requestId)
       }
-      if (doctor && consultation.doctorId !== doctor.id) {
-        return apiError('Unauthorized', 403)
-      }
+
+      enforceTenant(consultation.clinicId, targetClinicId, context)
     }
 
     if (validatedData.appointmentId) {
       const appointment = await prisma.appointment.findUnique({
         where: { id: validatedData.appointmentId },
+        select: {
+          id: true,
+          patientId: true,
+          clinicId: true,
+        },
       })
 
       if (!appointment) {
-        return apiError('Appointment not found', 404)
+        return apiError('Appointment not found', 404, context.requestId)
       }
 
-      // Verify user has access to this appointment
-      if (patient && appointment.patientId !== patient.id) {
-        return apiError('Unauthorized', 403)
+      // Enforce: appointment must belong to the same patient and clinic
+      if (appointment.patientId !== targetPatientId) {
+        return apiError('Appointment does not belong to the specified patient', 400, context.requestId)
       }
-      if (doctor && appointment.doctorId !== doctor.id) {
-        return apiError('Unauthorized', 403)
-      }
+
+      enforceTenant(appointment.clinicId, targetClinicId, context)
     }
 
-    // Determine patient ID for file association
-    let patientId: string
-    if (patient) {
-      patientId = patient.id
-    } else if (validatedData.consultationId) {
-      const consultation = await prisma.consultation.findUnique({
-        where: { id: validatedData.consultationId },
-        select: { patientId: true },
-      })
-      patientId = consultation!.patientId
-    } else if (validatedData.appointmentId) {
-      const appointment = await prisma.appointment.findUnique({
-        where: { id: validatedData.appointmentId },
-        select: { patientId: true },
-      })
-      patientId = appointment!.patientId
-    } else {
-      return apiError('Patient association required (consultationId or appointmentId)', 400)
-    }
-
-    // Generate unique file path (already sanitized)
+    // 5. Generate unique file path
     const timestamp = Date.now()
-    const filePath = `patients/${patientId}/${timestamp}-${validatedData.fileName}`
+    const filePath = `patients/${targetPatientId}/${timestamp}-${sanitizedFileName}`
 
-    // Generate signed upload URL (valid for 1 hour)
+    // 6. Generate signed upload URL (valid for 1 hour)
     const uploadUrl = await generateSignedUploadUrl(filePath, validatedData.fileType, 60)
 
-    // Create file record in database (status: PENDING until upload completes)
+    // 7. Create file record with all required fields
+    // Note: createdByUserId is required and tracks who created the file
     const fileRecord = await prisma.fileRecord.create({
       data: {
-        patientId,
-        fileName: validatedData.fileName,
+        patientId: targetPatientId,
+        clinicId: targetClinicId,
+        createdByUserId: session.id, // Required field for audit trail
+        fileName: sanitizedFileName,
         fileType: validatedData.fileType,
         fileSize: validatedData.fileSize,
-        storageUrl: '', // Will be updated after upload
+        storageUrl: '', // Will be updated after upload completes via PUT endpoint
         storagePath: filePath,
         category: validatedData.category || 'General',
-        description: validatedData.description || null,
-        uploadedBy: user.id,
+        description: sanitizedDescription || null,
         encrypted: false,
       },
     })
 
-    logAudit('FILE_UPLOAD_URL_GENERATED', 'file', fileRecord.id, user.id, true, {
-      requestId,
-      fileName: validatedData.fileName,
-      fileSize: validatedData.fileSize,
-    })
-    
-    const response = new Response(
-      JSON.stringify({
+    // 8. Audit log
+    logAudit(
+      'FILE_UPLOAD_URL_GENERATED',
+      'file',
+      fileRecord.id,
+      session.id,
+      true,
+      {
+        requestId: context.requestId,
+        fileName: sanitizedFileName,
+        fileSize: validatedData.fileSize,
+        patientId: targetPatientId,
+        clinicId: targetClinicId,
+        userRole: session.role,
+      }
+    )
+
+    return apiSuccess(
+      {
         uploadUrl,
         fileId: fileRecord.id,
         filePath,
         expiresIn: 3600, // 1 hour in seconds
-      }),
-      {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }
+      },
+      200,
+      context.requestId
     )
-    return addSecurityHeaders(response)
   } catch (error: any) {
-    return addSecurityHeaders(handleApiError(error, 'Failed to generate upload URL', undefined, requestId))
+    const statusCode = (error as Error & { statusCode?: number }).statusCode || 500
+    const message = error.message || 'Internal server error'
+    
+    if (statusCode === 400 || statusCode === 401 || statusCode === 403) {
+      return apiError(message, statusCode, context.requestId)
+    }
+    return apiError(message, statusCode, context.requestId)
   }
 }
 
-// TODO: PUT - Confirm upload completion and update file record
+/**
+ * PUT - Confirm upload completion and update file record
+ * 
+ * Requirements:
+ * - User must be the one who created the file (createdByUserId)
+ * - FileRecord clinicId must match user's clinicId
+ */
 export async function PUT(request: NextRequest) {
-  const requestId = uuidv4()
+  const context = getGuardContext(request)
   
   try {
-    // Require authentication first (needed for user ID)
-    const user = await requireAuth(request)
-    
-    // Rate limiting: 10 uploads per minute
-    const rateLimitResponse = await firestoreRateLimiters.upload(request, user.id)
-    if (rateLimitResponse) {
-      return addSecurityHeaders(rateLimitResponse)
-    }
+    // 1. Require valid session
+    const session = await requireSession(request)
+    requireRole(session, ['doctor', 'patient'], context)
 
+    // 2. Validate request body
     const body = await request.json()
-    const { fileId } = z.object({ fileId: z.string() }).parse(body)
+    const { fileId } = z.object({ fileId: z.string().min(1, 'File ID is required') }).parse(body)
 
-    // Get file record
+    // 3. Fetch file record
     const fileRecord = await prisma.fileRecord.findUnique({
       where: { id: fileId },
+      select: {
+        id: true,
+        patientId: true,
+        clinicId: true,
+        createdByUserId: true,
+        storagePath: true,
+      },
     })
 
     if (!fileRecord) {
-      return apiError('File record not found', 404)
+      return apiError('File record not found', 404, context.requestId)
     }
 
-    // Verify user has access
-    if (fileRecord.uploadedBy !== user.id) {
-      return apiError('Unauthorized', 403)
+    // 4. Enforce: FileRecord clinicId must match user's clinicId
+    enforceTenant(fileRecord.clinicId, session.clinicId, context)
+
+    // 5. Enforce: User must be the one who created the file
+    if (fileRecord.createdByUserId !== session.id) {
+      logAudit(
+        'FILE_UPLOAD_CONFIRMATION_DENIED',
+        'file',
+        fileId,
+        session.id,
+        false,
+        {
+          requestId: context.requestId,
+          reason: 'User is not the file creator',
+          fileCreatedBy: fileRecord.createdByUserId,
+          attemptedBy: session.id,
+        }
+      )
+      return apiError('You can only confirm uploads for files you created', 403, context.requestId)
     }
 
-    // Generate signed download URL
+    // 6. Initialize Storage client and verify file exists
     const storage = getStorageClient()
     const bucket = getBucket()
     const file = bucket.file(fileRecord.storagePath)
 
-    // Check if file exists
+    // Check if file exists in storage
     const [exists] = await file.exists()
     if (!exists) {
-      return apiError('File not found in storage', 404)
+      return apiError('File not found in storage', 404, context.requestId)
     }
 
-    // Generate signed URL for access
+    // 7. Generate signed URL for download access
     const [downloadUrl] = await file.getSignedUrl({
       version: 'v4',
       action: 'read',
       expires: Date.now() + 365 * 24 * 60 * 60 * 1000, // 1 year
     })
 
-    // Update file record with storage URL
+    // 8. Update file record with storage URL
     const updated = await prisma.fileRecord.update({
       where: { id: fileId },
       data: {
         storageUrl: downloadUrl,
       },
+      select: {
+        id: true,
+        fileName: true,
+        fileType: true,
+        fileSize: true,
+        storageUrl: true,
+        category: true,
+        createdAt: true,
+      },
     })
 
-    logAudit('FILE_UPLOAD_CONFIRMED', 'file', fileRecord.id, user.id, true, { requestId })
-    
-    const response = new Response(JSON.stringify(updated), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    })
-    return addSecurityHeaders(response)
+    // 9. Audit log
+    logAudit(
+      'FILE_UPLOAD_CONFIRMED',
+      'file',
+      fileId,
+      session.id,
+      true,
+      {
+        requestId: context.requestId,
+        patientId: fileRecord.patientId,
+        clinicId: fileRecord.clinicId,
+      }
+    )
+
+    return apiSuccess(updated, 200, context.requestId)
   } catch (error: any) {
-    return addSecurityHeaders(handleApiError(error, 'Failed to confirm upload', undefined, requestId))
+    const statusCode = (error as Error & { statusCode?: number }).statusCode || 500
+    const message = error.message || 'Internal server error'
+    
+    if (statusCode === 400 || statusCode === 401 || statusCode === 403) {
+      return apiError(message, statusCode, context.requestId)
+    }
+    return apiError(message, statusCode, context.requestId)
   }
 }
-

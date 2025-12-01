@@ -6,6 +6,7 @@ import { NextRequest } from "next/server"
 import { apiError, apiSuccess } from "@/lib/auth/api-protection"
 import { requireSession, requireRole, getGuardContext } from "@/lib/auth/guards"
 import { withClinicScope } from "@/lib/auth/tenant-scope"
+import { enforceTenant } from "@/lib/auth/tenant"
 import { prisma } from "@/db/prisma"
 
 // GET - Get doctor billing data
@@ -23,28 +24,16 @@ export async function GET(request: NextRequest) {
       return apiError("Doctor account pending approval", 403, context.requestId)
     }
 
-    // Get doctor record with clinic scoping
+    // OPTIMIZED: Get doctor record with minimal SELECT (removed appointments to avoid over-fetching)
     const doctor = await prisma.doctor.findUnique({
       where: { 
         userId: session.id,
         clinicId: session.clinicId, // Tenant isolation
       },
-      include: {
-        appointments: {
-          include: {
-            patient: {
-              include: {
-                user: {
-                  select: {
-                    firstName: true,
-                    lastName: true,
-                    email: true,
-                  },
-                },
-              },
-            },
-          },
-        },
+      select: {
+        id: true,
+        userId: true,
+        clinicId: true,
       },
     })
 
@@ -52,25 +41,33 @@ export async function GET(request: NextRequest) {
       return apiError("Doctor profile not found", 404, context.requestId)
     }
 
+    // OPTIMIZED: Query payments directly with appointment join (no separate appointment query)
     // Get all payments for appointments with this doctor (with clinic scoping)
-    const appointmentIds = doctor.appointments
-      .filter((apt) => apt.clinicId === session.clinicId) // Additional clinic filter
-      .map((apt) => apt.id)
-    
     const payments = await prisma.payment.findMany({
-      where: {
-        appointmentId: { in: appointmentIds },
-      },
-      include: {
+      where: withClinicScope(session.clinicId, {
+        appointment: {
+          doctorId: doctor.id,
+          clinicId: session.clinicId,
+        },
+      }),
+      select: {
+        id: true,
+        patientId: true,
+        appointmentId: true,
+        amount: true,
+        currency: true,
+        status: true,
+        description: true,
+        stripePaymentId: true,
+        receiptUrl: true,
+        paidAt: true,
+        createdAt: true,
         patient: {
-          include: {
-            user: {
-              select: {
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
-            },
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
           },
         },
         appointment: {
@@ -97,11 +94,12 @@ export async function GET(request: NextRequest) {
       .filter((p) => p.status === "REFUNDED")
       .reduce((sum, p) => sum + Number(p.amount), 0)
 
-    // Format payments for response
+    // Format payments for response (minimize PHI exposure)
     const formattedPayments = payments.map((payment) => ({
       id: payment.id,
-      patientName: `${payment.patient.user.firstName} ${payment.patient.user.lastName}`.trim() || payment.patient.user.email,
-      patientEmail: payment.patient.user.email,
+      // SECURITY: Only include minimal patient identifiers, no full email
+      patientName: `${payment.patient.firstName} ${payment.patient.lastName}`.trim() || 'Unknown',
+      // Removed patientEmail to reduce PHI exposure - only include if absolutely necessary
       amount: Number(payment.amount),
       currency: payment.currency,
       status: payment.status,
@@ -173,14 +171,17 @@ export async function POST(request: NextRequest) {
       return apiError("Payment ID is required", 400, context.requestId)
     }
 
-    // Get payment
+    // Get payment with clinic verification
     const payment = await prisma.payment.findUnique({
       where: { id: paymentId },
       include: {
         appointment: {
           include: {
             doctor: {
-              select: { id: true, userId: true },
+              select: { id: true, userId: true, clinicId: true },
+            },
+            patient: {
+              select: { clinicId: true },
             },
           },
         },
@@ -191,9 +192,19 @@ export async function POST(request: NextRequest) {
       return apiError("Payment not found", 404, context.requestId)
     }
 
+    // SECURITY: Enforce tenant isolation - verify payment belongs to user's clinic
+    if (payment.clinicId !== session.clinicId) {
+      return apiError("Forbidden: Payment belongs to different clinic", 403, context.requestId)
+    }
+
     // Verify doctor owns this payment (through appointment)
     if (!payment.appointment || payment.appointment.doctor.userId !== session.id) {
       return apiError("Unauthorized", 403, context.requestId)
+    }
+
+    // Additional clinic verification through appointment
+    if (payment.appointment.doctor.clinicId !== session.clinicId) {
+      return apiError("Forbidden: Appointment belongs to different clinic", 403, context.requestId)
     }
 
     if (payment.status !== "COMPLETED") {

@@ -1,20 +1,68 @@
-// TODO: Implement payment API routes
-// TODO: Add POST /api/payments/checkout - create Stripe checkout session
-// TODO: Add POST /api/payments/webhook - handle Stripe webhooks
-// TODO: Add GET /api/payments/subscription - get user subscription
-// TODO: Add POST /api/payments/cancel - cancel subscription
-// TODO: Add payment method management
-// TODO: Add invoice history
-// TODO: Implement usage-based billing for AI features
+/**
+ * Payment API Route - Protected Stub
+ * 
+ * This endpoint requires authentication and role-based access control.
+ * Full implementation pending.
+ */
 
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest } from 'next/server'
+import { apiError, apiSuccess } from '@/lib/auth/api-protection'
+import { requireSession, requireRole, getGuardContext } from '@/lib/auth/guards'
 
-// TODO: Implement POST checkout endpoint
+/**
+ * POST - Create checkout session
+ * Protected: Requires authenticated user (doctor or patient)
+ */
 export async function POST(request: NextRequest) {
-  // TODO: Parse request body (priceId, customerId)
-  // TODO: Create Stripe checkout session
-  // TODO: Return checkout session URL
+  const context = getGuardContext(request)
   
-  return NextResponse.json({ message: 'Payment endpoint - to be implemented' })
+  try {
+    // SECURITY: Require valid session
+    const session = await requireSession(request)
+    requireRole(session, ['doctor', 'patient'], context)
+
+    // TODO: Implement Stripe checkout session creation
+    // TODO: Validate request body with Zod schema
+    // TODO: Enforce clinicId matching
+    // TODO: Create payment record with clinicId
+    // TODO: Return checkout session URL
+
+    return apiError('Payment endpoint implementation pending', 501, context.requestId)
+  } catch (error: any) {
+    const statusCode = (error as Error & { statusCode?: number }).statusCode || 500
+    const message = error.message || 'Internal server error'
+    
+    if (statusCode === 401 || statusCode === 403) {
+      return apiError(message, statusCode, context.requestId)
+    }
+    return apiError(message, statusCode, context.requestId)
+  }
 }
 
+/**
+ * GET - Get payment information
+ * Protected: Requires authenticated user (doctor or patient)
+ */
+export async function GET(request: NextRequest) {
+  const context = getGuardContext(request)
+  
+  try {
+    // SECURITY: Require valid session
+    const session = await requireSession(request)
+    requireRole(session, ['doctor', 'patient'], context)
+
+    // TODO: Implement payment retrieval
+    // TODO: Enforce clinicId matching
+    // TODO: Return payment information
+
+    return apiError('Payment endpoint implementation pending', 501, context.requestId)
+  } catch (error: any) {
+    const statusCode = (error as Error & { statusCode?: number }).statusCode || 500
+    const message = error.message || 'Internal server error'
+    
+    if (statusCode === 401 || statusCode === 403) {
+      return apiError(message, statusCode, context.requestId)
+    }
+    return apiError(message, statusCode, context.requestId)
+  }
+}

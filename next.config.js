@@ -1,8 +1,5 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  experimental: {
-    // Enable App Router features
-  },
   images: {
     domains: ['storage.googleapis.com'],
   },
@@ -13,4 +10,3 @@ const nextConfig = {
 }
 
 module.exports = nextConfig
-

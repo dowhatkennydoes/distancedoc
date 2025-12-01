@@ -9,6 +9,7 @@ import { withClinicScope } from "@/lib/auth/tenant-scope"
 import { prisma } from "@/db/prisma"
 import { createClient } from "@/lib/supabase/server"
 import { z } from "zod"
+import { getCachedDoctorProfile, setCachedDoctorProfile, invalidateDoctorProfile } from "@/lib/cache/doctor-profiles"
 
 const UpdateProfileSchema = z.object({
   user: z.object({
@@ -42,31 +43,34 @@ export async function GET(request: NextRequest) {
       return apiError("Doctor account pending approval", 403, context.requestId)
     }
 
-    // Get doctor record with clinic scoping
-    const doctor = await prisma.doctor.findUnique({
-      where: { 
-        userId: session.id,
-        clinicId: session.clinicId, // Tenant isolation
-      },
-    })
+    // Try to get from cache first
+    let cachedProfile = await getCachedDoctorProfile(session.id)
 
-    if (!doctor) {
-      return apiError("Doctor profile not found", 404, context.requestId)
-    }
+    if (!cachedProfile) {
+      // Cache miss - fetch from database
+      const doctor = await prisma.doctor.findUnique({
+        where: { 
+          userId: session.id,
+          clinicId: session.clinicId, // Tenant isolation
+        },
+      })
 
-    // Get user information from Supabase
-    const supabase = await createClient()
-    const { data: userData, error: userError } = await supabase.auth.getUser()
+      if (!doctor) {
+        return apiError("Doctor profile not found", 404, context.requestId)
+      }
 
-    if (userError || !userData.user) {
-      return apiError("User not found", 404)
-    }
+      // Get user information from Supabase
+      const supabase = await createClient()
+      const { data: userData, error: userError } = await supabase.auth.getUser()
 
-    // Get user metadata
-    const userMetadata = userData.user.user_metadata || {}
+      if (userError || !userData.user) {
+        return apiError("User not found", 404)
+      }
 
-    return apiSuccess(
-      {
+      // Get user metadata
+      const userMetadata = userData.user.user_metadata || {}
+
+      cachedProfile = {
         doctor,
         user: {
           firstName: userMetadata.firstName || "",
@@ -74,10 +78,13 @@ export async function GET(request: NextRequest) {
           email: userData.user.email || "",
           phoneNumber: userMetadata.phoneNumber || "",
         },
-      },
-      200,
-      context.requestId
-    )
+      }
+
+      // Cache the profile (15 minutes TTL)
+      await setCachedDoctorProfile(session.id, cachedProfile, 900)
+    }
+
+    return apiSuccess(cachedProfile, 200, context.requestId)
   } catch (error: any) {
     const statusCode = (error as Error & { statusCode?: number }).statusCode || 500
     const message = error.message || "Internal server error"
@@ -185,19 +192,21 @@ export async function PUT(request: NextRequest) {
     const { data: userData } = await supabase.auth.getUser()
     const userMetadata = userData?.user?.user_metadata || {}
 
-    return apiSuccess(
-      {
-        doctor: updatedDoctor,
-        user: {
-          firstName: userMetadata.firstName || "",
-          lastName: userMetadata.lastName || "",
-          email: userData?.user?.email || "",
-          phoneNumber: userMetadata.phoneNumber || "",
-        },
+    const updatedProfile = {
+      doctor: updatedDoctor,
+      user: {
+        firstName: userMetadata.firstName || "",
+        lastName: userMetadata.lastName || "",
+        email: userData?.user?.email || "",
+        phoneNumber: userMetadata.phoneNumber || "",
       },
-      200,
-      context.requestId
-    )
+    }
+
+    // Invalidate and refresh cache
+    await invalidateDoctorProfile(session.id)
+    await setCachedDoctorProfile(session.id, updatedProfile, 900)
+
+    return apiSuccess(updatedProfile, 200, context.requestId)
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       return apiError(`Validation error: ${error.errors.map((e) => e.message).join(", ")}`, 400, context.requestId)

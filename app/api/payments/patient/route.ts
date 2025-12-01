@@ -36,21 +36,30 @@ export async function GET(request: NextRequest) {
     // Verify ownership - patient can only access their own payments
     await requireOwnership(session.id, patient.id, session.role, context)
 
-    // Get payments with clinic scoping (through patient)
+    // OPTIMIZED: Get payments with clinic scoping and minimal SELECT to reduce over-fetching
     const payments = await prisma.payment.findMany({
-      where: { patientId: patient.id },
-      include: {
+      where: withClinicScope(session.clinicId, {
+        patientId: patient.id,
+      }),
+      select: {
+        id: true,
+        amount: true,
+        currency: true,
+        status: true,
+        description: true,
+        appointmentId: true,
+        paidAt: true,
+        receiptUrl: true,
+        createdAt: true,
         appointment: {
-          include: {
+          select: {
+            id: true,
+            scheduledAt: true,
             doctor: {
-              include: {
-                user: {
-                  select: {
-                    firstName: true,
-                    lastName: true,
-                    email: true,
-                  },
-                },
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
               },
             },
           },
@@ -66,7 +75,7 @@ export async function GET(request: NextRequest) {
       currency: payment.currency,
       status: payment.status,
       description: payment.description || (payment.appointment
-        ? `Consultation - ${payment.appointment.doctor.user.firstName || ''} ${payment.appointment.doctor.user.lastName || ''}`.trim() || payment.appointment.doctor.user.email
+        ? `Consultation - ${payment.appointment.doctor.firstName || ''} ${payment.appointment.doctor.lastName || ''}`.trim()
         : 'Payment'),
       appointmentId: payment.appointmentId,
       paidAt: payment.paidAt,
